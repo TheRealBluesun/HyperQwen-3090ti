@@ -56,3 +56,4 @@ serve-model-path-match.patch
 tokenize-v1-route.patch
 marlin-int8-asym-zp.patch
 compile-key-runtime-knobs.patch
+auth-deny-default.patch
