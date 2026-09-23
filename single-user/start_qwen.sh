@@ -361,17 +361,10 @@ if [ "$SPEC" = "dflash2" ]; then
       MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-245760}}
     fi
     KV_MEM=${KV_MEM-5261334938}
-    # Above 7 drafts the decode graphs are captured for BOTH block lengths, which is
-    # ~1.8 GiB rather than ~1.45 -- the same arithmetic CTX=long and CTX=fast already
-    # branch on. This branch did not, and said so in a comment ("the graphs stay at the
-    # k=7 size") that stops being true the moment anyone sets DFLASH_TOKENS. The pool is
-    # then sized as if that memory were free and the server does not come up at 240k on
-    # 24 GB, which is what an independent 3090 Ti report hit (PR #13).
-    if [ "$DRAFT_TOKENS" -gt 7 ]; then
-      export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
-    else
-      export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
-    fi
+    # Above 7 drafts the decode graphs are captured for BOTH block lengths (~1.8 GiB rather
+    # than ~1.45); on 0.28 this branch exported VLLM_V2_CUDAGRAPH_MEM_MIB to tell the runner
+    # so. vLLM 0.29 profiles its graph memory itself and nothing reads that knob any more
+    # (the hunk that did retired with the port), so the pinned KV_MEM is the only budget here.
   elif [ "$CTX" = "long" ]; then
     # int8 KV: measured 136,429 tokens of pool at DFLASH_TOKENS=7 with prefix caching on
     # (138,696 without), against bf16's 69,758 in the same pinned 5.2 GiB. DFLASH_TOKENS>7
@@ -379,11 +372,6 @@ if [ "$SPEC" = "dflash2" ]; then
     MAX_SEQS=${MAX_SEQS:-4}
     MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-131072}}
     KV_MEM=${KV_MEM-5583457484}
-    if [ "$DRAFT_TOKENS" -gt 7 ]; then
-      export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
-    else
-      export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
-    fi
   elif [ "$DRAFT_TOKENS" -gt 7 ]; then
     # 4 slots and 56k instead of 8 and 64k: the aligned state pages and the bigger decode
     # graphs are what the long block costs, and this is where they still fit next to the
@@ -393,17 +381,13 @@ if [ "$SPEC" = "dflash2" ]; then
     KV_MEM=${KV_MEM-5583457484}
     # Decode graphs are captured for both block lengths (the drafter's and the full verify
     # block), or the short step -- the common one -- runs piecewise and costs 8%. That is
-    # 1.8 GiB of graphs instead of 1.45.
-    export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
+    # 1.8 GiB of graphs instead of 1.45; 0.29 accounts for it in its own profiling.
   else
     MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-65536}}
     KV_MEM=${KV_MEM-5583457484}
-    # If you tune GPU_UTIL instead, make the V2 runner count its CUDA graphs (~1.2-1.3 GiB
-    # at these capture sizes) as well:
-    export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
   fi
-  # The three memory budgets above (the pinned KV_MEM, GPU_UTIL, and the V2 runner's
-  # graph reservation) are sized for the shipped 1.2 GiB W4A16 head with about a
+  # The two memory budgets above (the pinned KV_MEM and GPU_UTIL; on 0.29 the runner's
+  # CUDA-graph memory is profiled, not reserved by a knob) are sized for the shipped 1.2 GiB W4A16 head with about a
   # gigabyte to spare on a 24 GiB card, and none of them knows the drafter's size. A bf16
   # community drafter (3.5 to 4.0 GiB) does not fit them at any context: the floor is the
   # per-request state, not the token count, and a bigger drafter is charged twice, as
@@ -421,7 +405,7 @@ if [ "$SPEC" = "dflash2" ]; then
     DRAFT_GIB=$(( (DRAFT_BYTES + 536870912) / 1073741824 ))
     if [ -n "$KV_MEM" ] && [ -z "${DFLASH_MAX_LEN:-}" ] && [ -z "$USER_MAX_LEN" ]; then
       echo "[start_qwen] WARNING: the drafter at $DRAFT is about ${DRAFT_GIB} GiB of weights; the" \
-           "memory defaults (KV_MEM=$KV_MEM pinned, GPU_UTIL=$GPU_UTIL, VLLM_V2_CUDAGRAPH_MEM_MIB=$VLLM_V2_CUDAGRAPH_MEM_MIB," \
+           "memory defaults (KV_MEM=$KV_MEM pinned, GPU_UTIL=$GPU_UTIL," \
            "MAX_LEN=$MAX_LEN) are sized for the shipped 1.2 GiB head and a 24 GiB card, and a" \
            "drafter this size does not fit them at any context (the per-request state is the" \
            "floor, #25 item 13). Measured to serve a 4 GiB bf16 drafter on 24 GiB:" \
@@ -435,12 +419,12 @@ if [ "$SPEC" = "dflash2" ]; then
   MAX_SEQS=${MAX_SEQS:-8}
   # The V2 model runner captures decode graphs in multiples of k+1 tokens: cover MAX_SEQS
   # requests, but never ask for more than 64 query tokens' worth. Every default in this
-  # script lands on 64 or below (8x8 at k=7, 4x16 at k=15), and VLLM_V2_CUDAGRAPH_MEM_MIB
-  # above is sized for that. `DFLASH_TOKENS=15 MAX_SEQS=8` asks for 128, which boots and
+  # script lands on 64 or below (8x8 at k=7, 4x16 at k=15), and the runner's graph memory
+  # (profiled on 0.29) is sized for that. `DFLASH_TOKENS=15 MAX_SEQS=8` asks for 128, which boots and
   # then dies on the first concurrent batch -- torch.OutOfMemoryError inside the engine,
   # EngineDeadError, every request 500 while /health still answers. Past the cap the
   # bigger batches run piecewise instead of captured: slower, alive. Set CG explicitly to
-  # override, and raise VLLM_V2_CUDAGRAPH_MEM_MIB with it.
+  # override.
   CG=${CG:-$((MAX_SEQS * (DRAFT_TOKENS + 1) > 64 ? 64 : MAX_SEQS * (DRAFT_TOKENS + 1)))}
   # Seats are admissions, not residency. Every RESIDENT request needs 1+k recurrent-state
   # slots out of the same pool before it stores one token of context: 0.88 GiB at
@@ -521,26 +505,38 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # block (#174). vLLM's default is dense, and at dense the snapshots of two long
   # conversations advanced in turn do not fit beside each other: on the reference
   # 3090 two ~32.6K chats alternating reused 0% and re-prefilled for 31.8 s on every
-  # turn; with one in six they reuse 93-99.5% at 0.4-2.6 s. One ~103K chat on its own
+  # turn; with one in six they reuse 93-99.5% at 0.4-2.6 s (0.28). On 0.29 the first
+  # reuse after a cold turn lands on the last retained snapshot, not the last block: at
+  # 32.6K a side it was 80.0% (26,112 = 2 x 13056) at 7.0 s, then 99.3-99.4% at ~0.5 s
+  # from the next turn on, against 0% and ~29 s per turn dense. One ~103K chat on its own
   # keeps 98.7-99.8%, and a passcode inside the reused prefix comes back right 3/3,
   # so the sparser restore path returns the right state.
   # The interval is in tokens and vLLM refuses one that is not a multiple of the
   # attention block, and that block moves with the draft count (the Mamba page holds
   # the speculative state slots): 2176 at 7 drafts, 2432 at 15, both measured. Other
   # draft counts stay dense and say how to set it by hand. PREFIX_RETENTION= (empty)
-  # forces dense; an exported VLLM_PREFIX_CACHE_RETENTION_INTERVAL always wins.
-  if [ "$CTX" = "huge" ] && [ "$SPEC" = "dflash2" ] \
-     && [ -z "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL+x}" ]; then
-    case $DRAFT_TOKENS in 7) RETENTION=13056 ;; 15) RETENTION=14592 ;; *) RETENTION= ;; esac
-    RETENTION=${PREFIX_RETENTION-$RETENTION}
-    if [ -n "$RETENTION" ]; then
-      export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$RETENTION
-    elif [ -z "${PREFIX_RETENTION+x}" ]; then
-      echo "[start_qwen] CTX=huge DFLASH_TOKENS=$DRAFT_TOKENS: no measured block size, so" \
-           "prefix retention stays dense and two long conversations advanced in turn will" \
-           "evict each other (#174). Set PREFIX_RETENTION to 6x the 'attention block size'" \
-           "line this boot prints." >&2
-    fi
+  # forces dense; --prefix-cache-retention-interval in EXTRA_ARGS always wins, then an
+  # exported VLLM_PREFIX_CACHE_RETENTION_INTERVAL.
+  # On 0.29 the interval has to go in as the flag. `vllm serve` still reads the
+  # deprecated env var (and logs the deprecation), but the flag's own unset default
+  # overrides it, so hybrid + EAGLE falls back to dense with no error: an exported
+  # 13057, which the flag refuses, boots. An exported value is carried over as the flag.
+  if [ "$CTX" = "huge" ] && [ "$SPEC" = "dflash2" ]; then
+    case " ${EXTRA_ARGS:-} " in
+      *"--prefix-cache-retention-interval"*) ;;
+      *)
+        case $DRAFT_TOKENS in 7) RETENTION=13056 ;; 15) RETENTION=14592 ;; *) RETENTION= ;; esac
+        RETENTION=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL-${PREFIX_RETENTION-$RETENTION}}
+        if [ -n "$RETENTION" ]; then
+          EXTRA_ARGS="--prefix-cache-retention-interval $RETENTION ${EXTRA_ARGS}"
+        elif [ -z "${PREFIX_RETENTION+x}" ] && [ -z "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL+x}" ]; then
+          echo "[start_qwen] CTX=huge DFLASH_TOKENS=$DRAFT_TOKENS: no measured block size, so" \
+               "prefix retention stays dense and two long conversations advanced in turn will" \
+               "evict each other (#174). Set PREFIX_RETENTION to 6x the 'attention block size'" \
+               "line this boot prints." >&2
+        fi ;;
+    esac
+    unset VLLM_PREFIX_CACHE_RETENTION_INTERVAL
   fi
   # DFlash2 only: prefix caching and a CAPTURED (FULL) verify step do not mix on
   # that path. It is the capture, not the drafter: eager is clean, and so is
@@ -659,11 +655,20 @@ TOOL_ARGS=()
 # issue #51; llama-swap reads them). Off by default only because the timing
 # fields ride on the engine-stats path, so it cannot be paired with
 # --disable-log-stats in EXTRA_ARGS. --enable-prompt-tokens-details is always
-# on. vLLM's per-request *spec-decode* summary flag is nightly-only (not 0.27.1).
+# on. The per-request spec-decode summary is in 0.29.0 and rides with REQ_METRICS=1.
 # Array, not $( [ ] && echo ): that substitution exits 1 when the test is
 # false, which kills a launcher running under `set -e` silently (#59).
 METRICS_ARGS=()
-[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
+if [ "${REQ_METRICS:-0}" = 1 ]; then
+  # vLLM 0.29.0: per-request speculative-decoding acceptance metrics ride in the response under
+  # metrics.speculative_decoding (n == 1 only; the field is experimental, shape as of v0.29.0). summary
+  # is mean acceptance length, draft acceptance rate and the step histogram; REQ_METRICS_DETAILED=1
+  # adds the ordered per-step accepted/proposed arrays, which upstream says is not free, so it is a
+  # separate opt-in and off in every profile anyone benchmarks (#66, #75, gotcha 53).
+  SPEC_METRICS=summary; [ "${REQ_METRICS_DETAILED:-0}" = 1 ] && SPEC_METRICS=detailed
+  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage
+                --per-request-spec-decode-metrics "$SPEC_METRICS")
+fi
 
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
 # 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps

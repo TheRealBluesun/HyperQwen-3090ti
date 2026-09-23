@@ -17,8 +17,8 @@
 #    checkpoint); VISION=1 keeps it for a client that sends images
 #  - expandable_segments is required: the DeltaNet prefill kernels allocate
 #    transient workspace and fragment the allocator, OOMs at util >= 0.978 without it
-#  - gpu-memory-utilization 0.972 is the sweet spot on a headless box
-#    (X/display holds ~220 MB; 0.98 fails the startup free-memory check)
+#  - gpu-memory-utilization 0.95 on vLLM 0.29 (0.972 on 0.28): see the KV=fp8
+#    branch below for why the default moved with the pin
 #  - max-num-batched-tokens 2048 beats 8192 here: bigger chunks inflate the
 #    profiled activation peak, which shrinks the KV/state page pool
 #  - kv-cache-dtype fp8 roughly doubles the usable context/pool
@@ -79,7 +79,16 @@ elif [ "$KV" = "kvarn" ]; then
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.25}
 else
   MAX_LEN=${MAX_LEN:-150000}
-  GPU_UTIL=${GPU_UTIL:-0.972}
+  # 0.95, not 0.28's 0.972. 0.29 with memory-profile-after-warmup and
+  # cudagraph-memory-from-allocator stops over-reserving ~1.5 GiB (KV 6.09 GiB at
+  # 0.972 on 0.28, 7.63 on 0.29, same box and settings), and at 0.972 that ~1.5 GiB
+  # was the headroom batch's unprofiled warmup transients lived in: 0.972 OOMs in
+  # warmup on 0.29 on a 3090, tower on or off (#182). Ladder on the reference 3090,
+  # boot plus 128 requests at 64-way concurrency: 0.93, 0.94, 0.95 and 0.96 all
+  # boot and serve with VISION=0 and 1, 0.972 does not. 0.95 keeps one 0.01 step
+  # below the highest value that passed, boots cold to the same pool as warm
+  # (219,587 tokens with the tower), and holds at least the pool 0.28 had at 0.972.
+  GPU_UTIL=${GPU_UTIL:-0.95}
   KV_ARGS="--kv-cache-dtype fp8"
 fi
 # int8 activations: "int8" (default) or empty for W4A16; layers: regex on the
@@ -124,7 +133,16 @@ TOOL_ARGS=()
 # Array, not $( [ ] && echo ): the command substitution exits 1 when the test
 # is false, which under `set -e` killed this script silently (#59).
 METRICS_ARGS=()
-[ "${REQ_METRICS:-0}" = 1 ] && METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
+if [ "${REQ_METRICS:-0}" = 1 ]; then
+  # vLLM 0.29.0: per-request speculative-decoding acceptance metrics ride in the response under
+  # metrics.speculative_decoding (n == 1 only; the field is experimental, shape as of v0.29.0). summary
+  # is mean acceptance length, draft acceptance rate and the step histogram; REQ_METRICS_DETAILED=1
+  # adds the ordered per-step accepted/proposed arrays, which upstream says is not free, so it is a
+  # separate opt-in and off in every profile anyone benchmarks (#66, #75, gotcha 53).
+  SPEC_METRICS=summary; [ "${REQ_METRICS_DETAILED:-0}" = 1 ] && SPEC_METRICS=detailed
+  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage
+                --per-request-spec-decode-metrics "$SPEC_METRICS")
+fi
 
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
 # 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps

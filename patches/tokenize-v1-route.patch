@@ -8,13 +8,13 @@ prefix="/v1"; FastAPI derives each route's operation id from name + path +
 method, so the two mounts carry distinct ids (tokenize_tokenize_post /
 tokenize_v1_tokenize_post) and the OpenAPI schema stays valid.
 
---- exported from cpuchip/vllm 95147c3 (tokenize-v1-route); regenerate with scripts/export-patch.sh, do not edit ---
+--- exported from cpuchip/vllm da6a87935 (tokenize-v1-route); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/entrypoints/serve/tokenize/api_router.py b/entrypoints/serve/tokenize/api_router.py
-index 9695e6c..67a16b1 100644
+index 9cdd82fee..8eabf6f1f 100644
 --- a/entrypoints/serve/tokenize/api_router.py
 +++ b/entrypoints/serve/tokenize/api_router.py
-@@ -107,3 +107,10 @@
+@@ -99,3 +99,10 @@
              )
  
      app.include_router(router)
