@@ -1,0 +1,296 @@
+{
+ "label": "buun-baseline",
+ "url": "http://<server>:8001",
+ "model": "Qwen3.8-27B",
+ "time": "2026-09-24 16:04:51",
+ "runs": [
+  {
+   "ttft": 0.19501471519470215,
+   "decode_tps": 115.48659905063718,
+   "completion_tokens": 600,
+   "prompt_tokens": 46,
+   "name": "code",
+   "sampled": false,
+   "rep": 0
+  },
+  {
+   "ttft": 0.08414077758789062,
+   "decode_tps": 123.80002111962285,
+   "completion_tokens": 600,
+   "prompt_tokens": 46,
+   "name": "code",
+   "sampled": false,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07665514945983887,
+   "decode_tps": 117.65046800045704,
+   "completion_tokens": 600,
+   "prompt_tokens": 46,
+   "name": "code",
+   "sampled": false,
+   "rep": 2
+  },
+  {
+   "ttft": 0.16739654541015625,
+   "decode_tps": 52.58242034490558,
+   "completion_tokens": 557,
+   "prompt_tokens": 27,
+   "name": "prose",
+   "sampled": false,
+   "rep": 0
+  },
+  {
+   "ttft": 0.08650732040405273,
+   "decode_tps": 53.553577107711156,
+   "completion_tokens": 600,
+   "prompt_tokens": 27,
+   "name": "prose",
+   "sampled": false,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07408666610717773,
+   "decode_tps": 49.527393269411995,
+   "completion_tokens": 597,
+   "prompt_tokens": 27,
+   "name": "prose",
+   "sampled": false,
+   "rep": 2
+  },
+  {
+   "ttft": 0.1708662509918213,
+   "decode_tps": 73.4972950181768,
+   "completion_tokens": 600,
+   "prompt_tokens": 35,
+   "name": "explain",
+   "sampled": false,
+   "rep": 0
+  },
+  {
+   "ttft": 0.07508492469787598,
+   "decode_tps": 81.71788487195205,
+   "completion_tokens": 600,
+   "prompt_tokens": 35,
+   "name": "explain",
+   "sampled": false,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07563090324401855,
+   "decode_tps": 72.96044040854323,
+   "completion_tokens": 600,
+   "prompt_tokens": 35,
+   "name": "explain",
+   "sampled": false,
+   "rep": 2
+  },
+  {
+   "ttft": 0.18676400184631348,
+   "decode_tps": 162.4659700737441,
+   "completion_tokens": 444,
+   "prompt_tokens": 42,
+   "name": "json",
+   "sampled": false,
+   "rep": 0
+  },
+  {
+   "ttft": 0.07805466651916504,
+   "decode_tps": 165.55828324392098,
+   "completion_tokens": 444,
+   "prompt_tokens": 42,
+   "name": "json",
+   "sampled": false,
+   "rep": 1
+  },
+  {
+   "ttft": 0.08500051498413086,
+   "decode_tps": 159.14083528361314,
+   "completion_tokens": 444,
+   "prompt_tokens": 42,
+   "name": "json",
+   "sampled": false,
+   "rep": 2
+  },
+  {
+   "ttft": 0.16799163818359375,
+   "decode_tps": 115.96359959555106,
+   "completion_tokens": 8,
+   "prompt_tokens": 24,
+   "name": "short",
+   "sampled": false,
+   "rep": 0
+  },
+  {
+   "ttft": 0.06316661834716797,
+   "decode_tps": 97.09197572711189,
+   "completion_tokens": 8,
+   "prompt_tokens": 24,
+   "name": "short",
+   "sampled": false,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07659745216369629,
+   "decode_tps": 116.2330827365329,
+   "completion_tokens": 8,
+   "prompt_tokens": 24,
+   "name": "short",
+   "sampled": false,
+   "rep": 2
+  },
+  {
+   "ttft": 0.17497706413269043,
+   "decode_tps": 115.70589176695073,
+   "completion_tokens": 600,
+   "prompt_tokens": 46,
+   "name": "code",
+   "sampled": true,
+   "rep": 0
+  },
+  {
+   "ttft": 0.0741422176361084,
+   "decode_tps": 113.76807622044394,
+   "completion_tokens": 600,
+   "prompt_tokens": 46,
+   "name": "code",
+   "sampled": true,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07442402839660645,
+   "decode_tps": 115.46451437046885,
+   "completion_tokens": 600,
+   "prompt_tokens": 46,
+   "name": "code",
+   "sampled": true,
+   "rep": 2
+  },
+  {
+   "ttft": 0.1684575080871582,
+   "decode_tps": 58.1019360195621,
+   "completion_tokens": 566,
+   "prompt_tokens": 27,
+   "name": "prose",
+   "sampled": true,
+   "rep": 0
+  },
+  {
+   "ttft": 0.07455635070800781,
+   "decode_tps": 57.29812290286657,
+   "completion_tokens": 600,
+   "prompt_tokens": 27,
+   "name": "prose",
+   "sampled": true,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07493925094604492,
+   "decode_tps": 58.26943404651107,
+   "completion_tokens": 600,
+   "prompt_tokens": 27,
+   "name": "prose",
+   "sampled": true,
+   "rep": 2
+  },
+  {
+   "ttft": 0.17085742950439453,
+   "decode_tps": 91.0415309196608,
+   "completion_tokens": 600,
+   "prompt_tokens": 35,
+   "name": "explain",
+   "sampled": true,
+   "rep": 0
+  },
+  {
+   "ttft": 0.07478022575378418,
+   "decode_tps": 93.46765010299012,
+   "completion_tokens": 600,
+   "prompt_tokens": 35,
+   "name": "explain",
+   "sampled": true,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07473421096801758,
+   "decode_tps": 86.82668380076797,
+   "completion_tokens": 600,
+   "prompt_tokens": 35,
+   "name": "explain",
+   "sampled": true,
+   "rep": 2
+  },
+  {
+   "ttft": 0.18308424949645996,
+   "decode_tps": 156.79157863257242,
+   "completion_tokens": 434,
+   "prompt_tokens": 42,
+   "name": "json",
+   "sampled": true,
+   "rep": 0
+  },
+  {
+   "ttft": 0.07410883903503418,
+   "decode_tps": 152.66848099417217,
+   "completion_tokens": 493,
+   "prompt_tokens": 42,
+   "name": "json",
+   "sampled": true,
+   "rep": 1
+  },
+  {
+   "ttft": 0.09054017066955566,
+   "decode_tps": 175.3890513135538,
+   "completion_tokens": 434,
+   "prompt_tokens": 42,
+   "name": "json",
+   "sampled": true,
+   "rep": 2
+  },
+  {
+   "ttft": 0.16465425491333008,
+   "decode_tps": 117.55712867164227,
+   "completion_tokens": 8,
+   "prompt_tokens": 24,
+   "name": "short",
+   "sampled": true,
+   "rep": 0
+  },
+  {
+   "ttft": 0.06302309036254883,
+   "decode_tps": 96.2346331726152,
+   "completion_tokens": 8,
+   "prompt_tokens": 24,
+   "name": "short",
+   "sampled": true,
+   "rep": 1
+  },
+  {
+   "ttft": 0.07442069053649902,
+   "decode_tps": 111.67538207572288,
+   "completion_tokens": 8,
+   "prompt_tokens": 24,
+   "name": "short",
+   "sampled": true,
+   "rep": 2
+  },
+  {
+   "ttft": 26.83885407447815,
+   "decode_tps": 45.42009225271434,
+   "completion_tokens": 64,
+   "prompt_tokens": 18380,
+   "name": "prefill16k",
+   "sampled": false,
+   "rep": 0
+  },
+  {
+   "ttft": 29.92480707168579,
+   "decode_tps": 56.20148049333897,
+   "completion_tokens": 64,
+   "prompt_tokens": 18379,
+   "name": "prefill16k",
+   "sampled": false,
+   "rep": 1
+  }
+ ]
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=HyperQwen (patched vLLM 0.29) Qwen3.8-27B W4A16 instance A (GPU0, 128k ctx, DFlash2, port 8001)
+After=network.target
+Conflicts=buun-27b-a.service orcabonsai.service qwen38.service
+
+[Service]
+Type=simple
+ExecStart=%h/build/HyperQwen/local-3090ti/deploy/run_a.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

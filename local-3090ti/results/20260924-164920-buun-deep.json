@@ -1,0 +1,17 @@
+{
+ "label": "buun-deep",
+ "url": "http://<server>:8001",
+ "model": "Qwen3.8-27B",
+ "time": "2026-09-24 16:45:33",
+ "runs": [
+  {
+   "ttft": 216.69378924369812,
+   "decode_tps": 40.83709371719787,
+   "completion_tokens": 400,
+   "prompt_tokens": 109369,
+   "name": "deep110k",
+   "sampled": false,
+   "rep": 0
+  }
+ ]
+}

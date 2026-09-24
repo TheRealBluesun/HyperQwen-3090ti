@@ -1,0 +1,17 @@
+--- a/model_executor/layers/utils.py
++++ b/model_executor/layers/utils.py	2026-09-24 21:47:04.649991507 +0000
+@@ -570,6 +570,14 @@
+ 
+     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
+     if backend_spec is None:
++        # qwen27-dev: split-K Triton GEMM for narrow BF16 linears (N <= 256) at decode sizes,
++        # e.g. the GDN in_proj_ba (N=96): cuBLAS GEMM + split-K reduce ~8 us -> ~3 us.
++        import os as _os
++
++        if _os.environ.get("VLLM_NARROW_GEMM", "0") == "1":
++            from vllm.model_executor.layers.narrow_gemm import narrow_unquantized_gemm
++
++            return narrow_unquantized_gemm
+         return default_unquantized_gemm
+ 
+     if not backend_spec.is_supported():
