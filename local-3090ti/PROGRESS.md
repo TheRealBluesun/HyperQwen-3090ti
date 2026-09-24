@@ -42,3 +42,13 @@ int4 GEMV that reads Marlin's layout: ~0.5–1 ms/step (2–4%), mostly on the s
   **140 µs (659 GB/s) at 1,680 MHz / 297 W**. So decode is power-limited: GEMM speed follows SM clock.
 - Implication: fusing kernels to cut launch boundaries (option 3 as planned) targets the wrong cause.
   Levers are (a) the power limit (PSU-constrained, owner decision) and (b) less SM work per weight byte.
+
+### Power-limit test on GPU0 (09-24, temporary; restored to 300 W afterwards)
+| GPU0 limit | ms/step | decode vs 300 W | prefill 18K (tok/s) | SM clock (avg busy) | measured draw |
+|---|---|---|---|---|---|
+| 300 W | 24.32 | — | ~1,060–1,140 | ~1,500 MHz | ~293 W |
+| 325 W | 22.47 | +8.2% | 1,201 | 1,767 MHz | 322 W |
+| 350 W | 22.00 | +10.5% | 1,237 | 1,876 MHz | 348 W |
+| 400 W | 21.95 | +10.8% | 1,266 | 1,927 MHz | 398 W |
+Knee at 325–350 W; above that decode is bandwidth-bound again. GPU1 (:8002) idle (~27 W) during the test.
+The cap exists because both cards share an 850 W PSU: owner decision (e.g. GPU0 350 / GPU1 250 keeps 600 W total).
