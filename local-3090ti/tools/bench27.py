@@ -13,6 +13,14 @@ PROMPTS = {
     "json": "Return a JSON array describing five fictional users with fields id, name, email, signup_date and a nested 'preferences' object. Output only JSON.",
     "short": "What is the capital of Australia? Answer in one sentence.",
 }
+def drafts():
+    """Speculative verify steps so far (vLLM /metrics); None if the server doesn't expose it."""
+    try:
+        for line in urllib.request.urlopen(URL + "/metrics", timeout=30).read().decode().splitlines():
+            if line.startswith("vllm:spec_decode_num_drafts_total"):
+                return float(line.rsplit(" ", 1)[1])
+    except Exception:
+        return None
 def model_id():
     return json.load(urllib.request.urlopen(URL + "/v1/models", timeout=30))["data"][0]["id"]
 def stream(messages, max_tokens, sampled):
@@ -23,7 +31,7 @@ def stream(messages, max_tokens, sampled):
     body["chat_template_kwargs"] = {"enable_thinking": False}
     req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
-    t0 = time.time(); t_first = t_last = None; usage = None; n_chunks = 0
+    d0 = drafts(); t0 = time.time(); t_first = t_last = None; usage = None; n_chunks = 0
     with urllib.request.urlopen(req, timeout=1200) as r:
         for line in r:
             line = line.strip()
@@ -39,7 +47,10 @@ def stream(messages, max_tokens, sampled):
     ct = (usage or {}).get("completion_tokens", n_chunks)
     pt = (usage or {}).get("prompt_tokens")
     dec = (ct - 1) / (t_last - t_first) if t_first and t_last > t_first and ct > 1 else None
-    return {"ttft": (t_first or time.time()) - t0, "decode_tps": dec, "completion_tokens": ct, "prompt_tokens": pt}
+    d1 = drafts(); steps = (d1 - d0) if d0 is not None and d1 is not None else None
+    ms_step = (t_last - t_first) * 1e3 / (steps - 1) if steps and steps > 1 and t_first and t_last > t_first else None
+    return {"ttft": (t_first or time.time()) - t0, "decode_tps": dec, "completion_tokens": ct, "prompt_tokens": pt,
+            "steps": steps, "ms_per_step": ms_step, "tok_per_step": ct / steps if steps else None}
 MODEL = model_id()
 res = {"label": LABEL, "url": URL, "model": MODEL, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "runs": []}
 stream([{"role": "user", "content": "Say hi."}], 8, False)  # warm-up
@@ -48,7 +59,7 @@ for sampled in (() if os.environ.get('ONLY_LONG') == '1' else (False, True)):
         for rep in range(REPS):
             x = stream([{"role": "user", "content": p}], 128 if name == "short" else 600, sampled)
             x.update(name=name, sampled=sampled, rep=rep); res["runs"].append(x)
-            print(f"{'sampled' if sampled else 'greedy '} {name:8s} rep{rep}: {x['completion_tokens']:4d} tok  decode {x['decode_tps'] or 0:6.1f} tok/s  ttft {x['ttft']:.2f}s", flush=True)
+            print(f"{'sampled' if sampled else 'greedy '} {name:8s} rep{rep}: {x['completion_tokens']:4d} tok  decode {x['decode_tps'] or 0:6.1f} tok/s  ttft {x['ttft']:.2f}s  {x['ms_per_step'] or 0:5.2f} ms/step  {x['tok_per_step'] or 0:4.2f} tok/step", flush=True)
 # prefill: unique 16K-token-ish prompt per rep (defeats prefix caching)
 base = open(os.path.join(HERE, "longtext.txt")).read()
 for rep in range(0 if os.environ.get('ONLY_LONG') == '1' else 2):
@@ -69,6 +80,10 @@ for sampled in (False, True):
         v = [r["decode_tps"] for r in res["runs"] if r["name"] == name and r["sampled"] == sampled and r["decode_tps"]]
         row.append(f"{name} {st.median(v):.1f}" if v else f"{name} -")
     print(("  sampled " if sampled else "  greedy  ") + " | ".join(row))
+ms = [r["ms_per_step"] for r in res["runs"] if r.get("ms_per_step") and r["name"] not in ("short", "prefill16k", "deep110k")]
+tps = [r["tok_per_step"] for r in res["runs"] if r.get("tok_per_step") and r["name"] not in ("short", "prefill16k", "deep110k")]
+if ms:
+    print(f"  step time: median {st.median(ms):.2f} ms/step over {len(ms)} runs (IQR {sorted(ms)[len(ms)//4]:.2f}-{sorted(ms)[3*len(ms)//4]:.2f}); tokens/step median {st.median(tps):.2f}")
 os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
 fn = os.path.join(HERE, "results", time.strftime("%Y%m%d-%H%M%S") + f"-{LABEL}.json")
 json.dump(res, open(fn, "w"), indent=1); print("saved", fn)

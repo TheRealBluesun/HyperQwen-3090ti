@@ -30,3 +30,15 @@ drafter fc 87%, down 85%, GDN in_proj 82%, attn qkv 82%, GDN out 74%, drafter o 
 makes no difference; atomic-add reduce doesn't apply (N ≥ 2048, bf16 on sm8x). In the server the same
 GEMMs run ~5–7% slower than isolated (launch ramp/tail, no PDL on Ampere). Realistic upside of a custom
 int4 GEMV that reads Marlin's layout: ~0.5–1 ms/step (2–4%), mostly on the small GEMMs, not ~2 ms.
+| 09-24 | bench27 now reports **ms per verify step** (from /metrics draft counters): stable to ±0.2 ms, unlike tok/s | — | — | — | — | service baseline: **24.32 ms/step**, 4.38 tokens/step median |
+| 09-24 | B: fused CUDA GDN decode (needs bf16 recurrent state; test only) | 233 / 110 / 165 / 264 | — | — | — | **24.14 ms/step (−0.7%)**: not worth bf16 state's quality risk or an fp16 kernel build. Dropped |
+
+### Option 3 premise check: the "in-context" GEMM gap is power throttling (09-24)
+- Per-kernel breakdown (prof p1, short decode, 24.1 ms/step): Marlin 18.5 ms/step in the server vs ~16.5 ms
+  summed from isolated microbenchmarks; the rest ~4.4 ms of small kernels + ~1.2 ms idle.
+- During sustained decode the 3090 Ti sits at its 300 W cap (throttle reason 0x4 = SW power cap):
+  SM ~1,500 MHz instead of ~1,950–2,100 boost; memory clock stays at max.
+- gate_up Marlin M=8 burst vs sustained (`tools/bench_marlin_sustained.py`): 107 µs (879 GB/s) vs
+  **140 µs (659 GB/s) at 1,680 MHz / 297 W**. So decode is power-limited: GEMM speed follows SM clock.
+- Implication: fusing kernels to cut launch boundaries (option 3 as planned) targets the wrong cause.
+  Levers are (a) the power limit (PSU-constrained, owner decision) and (b) less SM work per weight byte.
