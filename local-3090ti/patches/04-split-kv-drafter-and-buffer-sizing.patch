@@ -1,0 +1,192 @@
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -68,6 +68,7 @@
+     G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+     BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
+     NTILE: tl.constexpr, QUANT: tl.constexpr, FP8: tl.constexpr, Q_FP8: tl.constexpr,
++    WINDOW: tl.constexpr = 0, CAUSAL: tl.constexpr = True,
+ ):
+     pid = tl.program_id(0)
+     req = pid // NTILE
+@@ -94,8 +95,14 @@
+ 
+     # this segment's key range
+     tiles_total = (kv_len + TILE - 1) // TILE
+-    tiles_per_seg = (tiles_total + NSEG - 1) // NSEG
+-    t0 = seg * tiles_per_seg
++    # qwen27-dev: sliding window (the DFlash2 drafter's 2048-token layers). The lowest key any
++    # query row can see is (first query position) - WINDOW + 1, so the segments split only the
++    # tiles from there on -- same keys as the stock kernel's tile pruning, spread over NSEG.
++    t_lo = 0
++    if WINDOW > 0:
++        t_lo = tl.maximum(kv_len - q_len - WINDOW + 1, 0) // TILE
++    tiles_per_seg = (tiles_total - t_lo + NSEG - 1) // NSEG
++    t0 = t_lo + seg * tiles_per_seg
+     t1 = tl.minimum(t0 + tiles_per_seg, tiles_total)
+ 
+     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+@@ -136,7 +143,17 @@
+             s = tl.dot(qs, tl.trans(k)).to(tl.float32) * k_dsc
+         else:
+             s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
+-        allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
++        # mask semantics follow triton_attention_helpers.compute_kv_seq_mask:
++        # causal: key <= query; non-causal: key < kv_len; window: |query - key| < WINDOW
++        # (left side only when causal).
++        if CAUSAL:
++            allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
++        else:
++            allowed = k_ok[None, :] & row_ok[:, None]
++        if WINDOW > 0:
++            allowed = allowed & ((q_pos[:, None] - pos[None, :]) < WINDOW)
++            if not CAUSAL:
++                allowed = allowed & ((pos[None, :] - q_pos[:, None]) < WINDOW)
+         s = tl.where(allowed, s, float("-inf"))
+         m_new = tl.maximum(m_i, tl.max(s, 1))
+         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+@@ -224,7 +241,7 @@
+ 
+     def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale,
+             num_reqs, max_query_len, k_scale_cache=None, v_scale_cache=None,
+-            k_descale=None, v_descale=None, q_descale=None):
++            k_descale=None, v_descale=None, q_descale=None, window=0, causal=True):
+         """key/value_cache: [num_blocks, block_size, Hkv, D] bf16, or [.., D + pad] int8
+         with k/v_scale_cache [num_blocks, block_size, Hkv] float32 (per-token-head int8), or
+         [.., D] fp8 e4m3 with k/v_descale one-element float32 tensors (vLLM's per-tensor `fp8`)."""
+@@ -269,6 +286,7 @@
+             *(v_scale_cache.stride() if quant else (0, 0, 0)),
+             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
+             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
++            WINDOW=window, CAUSAL=causal,
+             num_warps=8 if D >= 256 else warps, num_stages=2,  # qwen27-dev: was warps (4), 1 stage
+         )
+         _spec_attn_combine[(num_reqs, Hq, max_query_len)](
+--- a/v1/attention/backends/flash_attn.py
++++ b/v1/attention/backends/flash_attn.py
+@@ -1943,7 +1943,26 @@
+     return _SPEC_ATTN_QMAX
+ 
+ 
+-def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, k_scale_cache=None, v_scale_cache=None):
++_SPEC_ATTN_MAX_REQS = None
++
++
++def _spec_attn_max_reqs() -> int:
++    """qwen27-dev: scheduler max_num_seqs, cached. The vLLM config is never set during a
++    forward, so the old lookup in _spec_attn_run always fell back to 256 requests: the target's
++    partial buffers took 1,935 MiB (and the drafter's would have taken 1.25 GiB) where 4 requests
++    need ~30 MiB. TritonAttentionImpl.__init__ primes this while the config is set. 0 = unknown."""
++    global _SPEC_ATTN_MAX_REQS
++    if _SPEC_ATTN_MAX_REQS is None:
++        from vllm.config import get_current_vllm_config_or_none
++
++        cfg = get_current_vllm_config_or_none()
++        if cfg is None:
++            return 0
++        _SPEC_ATTN_MAX_REQS = int(cfg.scheduler_config.max_num_seqs)
++    return _SPEC_ATTN_MAX_REQS
++
++
++def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, k_scale_cache=None, v_scale_cache=None, window=0, causal=True):
+     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
+ 
+     key = (impl.num_heads, impl.head_size, q.device)
+@@ -1951,11 +1970,7 @@
+     if att is None:
+         from vllm.config import get_current_vllm_config
+ 
+-        try:
+-            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
+-        except Exception:
+-            max_reqs = 256
+-        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
++        max_reqs = max(_spec_attn_max_reqs() or 256, cu_seqlens_q.shape[0] - 1)
+         att = SpecDecodeAttention(
+             max_reqs, impl.num_heads, impl.head_size, q.device,
+             qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
+@@ -1963,7 +1978,7 @@
+         _SPEC_ATTN[key] = att
+     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
+             cu_seqlens_q.shape[0] - 1, max_seqlen_q,
+-            k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
++            k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache, window=window, causal=causal)
+ 
+ 
+ def _spec_attn_run_fp8(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q,
+@@ -1979,11 +1994,7 @@
+     if att is None:
+         from vllm.config import get_current_vllm_config
+ 
+-        try:
+-            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
+-        except Exception:
+-            max_reqs = 256
+-        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
++        max_reqs = max(_spec_attn_max_reqs() or 256, cu_seqlens_q.shape[0] - 1)
+         att = SpecDecodeAttention(
+             max_reqs, impl.num_heads, impl.head_size, q.device,
+             qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -5,6 +5,7 @@
+ from dataclasses import dataclass, replace
+ from typing import ClassVar
+ 
++import os
+ import torch
+ 
+ import vllm.envs as envs
+@@ -45,6 +46,7 @@
+     _spec_attn_qmax,
+     _spec_attn_run,
+     _spec_attn_run_fp8,
++    _spec_attn_max_reqs,
+ )
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+@@ -703,6 +705,7 @@
+             )
+         self.use_alibi_sqrt = use_alibi_sqrt
+         self.chunk_lookback = chunk_lookback
++        _spec_attn_max_reqs()  # qwen27-dev: prime split-KV buffer sizing while the config is set
+         self.supports_quant_query_input = current_platform.is_cuda()
+ 
+         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+@@ -874,6 +877,16 @@
+                 max_seqlen_q, _spec_attn_qmax(self.num_heads // self.num_kv_heads), attn_metadata.causal, self.sliding_window,
+                 self.logits_soft_cap, self.alibi_slopes is not None, self.sinks is not None, self.chunk_lookback,
+                 mm_prefix_range_tensor is not None, attn_metadata.rswa_prefix_lens is not None, output_scale is not None)
++        # qwen27-dev: the split-KV kernel also takes sliding-window and non-causal layers now
++        # (the DFlash2 drafter: 5 non-causal 2048-window layers that ran the stock 2D kernel at
++        # 24 CTAs, ~182 us each on a 3090). VLLM_SPEC_ATTN_SWA=0 restores the old gate.
++        _sw = self.sliding_window
++        _has_sw = _sw is not None and tuple(_sw) != (-1, -1)
++        _swa_ok = os.environ.get("VLLM_SPEC_ATTN_SWA", "1") == "1"
++        _causal = attn_metadata.causal
++        # Split-KV only for batches the scheduler can produce (<= max_num_seqs): its partial
++        # buffers are sized once, on first use, for max(max_num_seqs, that batch). Profiling
++        # dummy batches bigger than that take the stock kernel instead of growing them.
+         if (
+             _spec_attn_enabled()
+             and (
+@@ -884,8 +897,9 @@
+                 )
+             )
+             and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
+-            and attn_metadata.causal
+-            and (self.sliding_window is None or self.sliding_window == (-1, -1))
++            and (_causal is True or (_swa_ok and _causal is False))
++            and (not _has_sw or _swa_ok)
++            and cu_seqlens_q.shape[0] - 1 <= _spec_attn_max_reqs()
+             and not self.logits_soft_cap
+             and self.alibi_slopes is None
+             and self.sinks is None
+@@ -925,6 +939,8 @@
+                 max_seqlen_q,
+                 k_scale_cache,
+                 v_scale_cache,
++                window=(1 + _sw[0]) if _has_sw else 0,
++                causal=_causal is True,
+             )
+             return output
+ 

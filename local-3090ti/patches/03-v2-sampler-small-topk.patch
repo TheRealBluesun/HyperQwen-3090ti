@@ -1,0 +1,15 @@
+--- a/v1/worker/gpu/sample/states.py
++++ b/v1/worker/gpu/sample/states.py
+@@ -109,7 +109,11 @@
+         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+         if top_k is None and top_p is None:
+             return logits
+-        return apply_top_k_top_p(logits, top_k, top_p)
++        # qwen27-dev: pass k_max (already on the CPU here) so small top-k (e.g. the model's
++        # default 20) takes the sort-free torch.topk path instead of the Triton pivot kernel,
++        # which measured 813 us/step on real verify logits (8 x 248K) on a 3090.
++        k_max = int(self.top_k.np[idx_mapping_np].max()) if top_k is not None else None
++        return apply_top_k_top_p(logits, top_k, top_p, k_max=k_max)
+ 
+     def any_greedy(self, idx_mapping_np: np.ndarray) -> bool:
+         return bool(np.any(self.temperature.np[idx_mapping_np] == 0.0))
