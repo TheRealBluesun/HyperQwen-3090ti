@@ -16,6 +16,8 @@ Build (JIT on first use; the prep step once):
     # install next to the vllm package (e.g. the dev PYTHONPATH overlay):
     #   marlin_tune_ext.py, marlin_best.py, marlin_tune_src/{mt/*, binding.cu, csrc/core/scalar_type.hpp}
 
-Measured on an RTX 3090 @ 350 W (M=8, isolated, us): gate_up 117.7 -> 114.0, GDN in_proj 57.3 -> 55.5,
-attn qkv 51.3 -> 50.1, down 58.9 -> 58.3, drafter qkv 24.7 -> 23.2. End to end: 24.13 -> 23.73 ms/step
-(memory-service replay), chat 23.73 -> 23.27 ms/step.
+The table (marlin_best.py) is (thread_k, thread_n, CTA count) per (N, K), from a sweep of the three
+small-M tile configs x CTA counts 24..82 at M=8 (mt_table.py / the cfg sweep). RTX 3090 @ 350 W, per call:
+gate_up 118.6 -> 113.3 us, GDN in_proj 57.3 -> 55.3, o_proj 24.6 -> 23.0, attn qkv 51.5 -> 50.1,
+down 59.1 -> 58.1, drafter qkv 24.9 -> 23.3, drafter o_proj 18.3 -> 16.6. End to end: 24.13 -> 23.54
+ms/step (memory-service replay), chat 23.73 -> 23.16 ms/step.

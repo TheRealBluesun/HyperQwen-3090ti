@@ -48,7 +48,7 @@ def _load():
 
 
 def set_table(table: dict) -> None:
-    """table: {(size_n, size_k): sms} for M<=8."""
+    """table: {(size_n, size_k): (thread_k, thread_n, sms)} for M<=8 (a bare int = sms, stock tiles)."""
     _TABLE.clear()
     _TABLE.update(table)
     _load()
@@ -57,7 +57,8 @@ def set_table(table: dict) -> None:
 def _impl(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm, workspace,
           b_type_id, size_m, size_n, size_k, is_k_full=True, use_atomic_add=False, use_fp32_reduce=False,
           is_zp_float=False):
-    sms = _TABLE.get((size_n, size_k))
+    cfg = _TABLE.get((size_n, size_k))
+    tk, tn, sms = (cfg if isinstance(cfg, tuple) else (-1, -1, cfg)) if cfg is not None else (-1, -1, None)
     if (sms is not None and size_m <= 8 and b_type_id == _U4B8 and a.dtype == torch.bfloat16
             and b_scales.dtype == torch.bfloat16 and b_scales.size(0) * 128 == size_k
             and b_bias is None and a_scales is None and global_scale is None
@@ -69,7 +70,7 @@ def _impl(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g
         ctmp = _CTMP.get(a.device)
         if ctmp is None:
             ctmp = _CTMP[a.device] = torch.empty(82 * 16 * 256, dtype=torch.float32, device=a.device)
-        _EXT.run(a, b_q_weight, b_scales, workspace, out, ctmp, size_m, size_n, size_k, -1, -1, sms, use_fp32_reduce)
+        _EXT.run(a, b_q_weight, b_scales, workspace, out, ctmp, size_m, size_n, size_k, tk, tn, sms, use_fp32_reduce)
         return out
     return torch.ops._C.marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm,
                                     workspace, b_type_id, size_m, size_n, size_k, is_k_full, use_atomic_add,

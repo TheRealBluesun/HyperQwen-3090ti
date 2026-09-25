@@ -44,5 +44,9 @@ second = [x.start() for x in re.finditer(r"\ntorch::stable::Tensor marlin_gemm\(
 m = m[:second] + "\n#endif\n"
 # the arch<750 stub references torch::stable in a never-compiled branch; drop it for the host pass too
 m = re.sub(r"torch::stable::Tensor marlin_gemm\([\s\S]*?return torch::stable::empty\(\{1, 1\}\);\n\}\n", "", m, count=1)
+# an explicit (thread_k, thread_n) must launch that config's thread count (128 for the 64x128 / 128x64 tiles)
+m = m.replace("thread_tfg = thread_config_t{thread_k, thread_n, default_threads};",
+              "thread_tfg = thread_config_t{thread_k, thread_n, (thread_k == 128 && thread_n == 128) || "
+              "(thread_k == 64 && thread_n == 256) ? default_threads : 128};")
 open(os.path.join(O, "host.cu"), "w").write(m)
 print(f"selector entries {nsel}, instantiations {ninst}")
