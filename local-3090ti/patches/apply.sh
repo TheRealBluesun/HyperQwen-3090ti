@@ -10,3 +10,5 @@ done
 # 06: CUDA split-KV verify attention (sm86). The kernel source is JIT-built on first use.
 patch -p1 -N -d "$V" < 06-cuda-verify-attention.patch
 cp 06-qwen27_sda.cu "$V/v1/attention/ops/qwen27_sda.cu"
+# 07: GDN attention metadata built once per step (shared across the 6 GDN kv-cache groups)
+patch -p1 -N -d "$V" < 07-gdn-shared-metadata-build.patch

@@ -1,0 +1,121 @@
+--- a/v1/attention/backends/gdn_attn.py
++++ b/v1/attention/backends/gdn_attn.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Backend for GatedDeltaNet attention."""
+ 
++import dataclasses
++import os
+ from dataclasses import dataclass
+ from typing import Literal
+ 
+@@ -38,6 +40,17 @@
+         return True
+ 
+ 
++
++# qwen27-dev: per-step metadata shared by the GDN builders of all kv-cache groups
++_GDN_STEP: dict = {"token": 0, "entry": None}
++_GDN_SHARED_BUFS: dict = {}
++
++
++def gdn_new_step() -> None:
++    """Called once per build_attn_metadata(): invalidates the previous step's shared entry."""
++    _GDN_STEP["token"] += 1
++    _GDN_STEP["entry"] = None
++
+ @dataclass
+ class GDNAttentionMetadata:
+     num_prefills: int
+@@ -164,6 +177,24 @@
+             dtype=torch.int32,
+             device=device,
+         )
++        # qwen27-dev: the GDN layers form several kv-cache groups (6 for Qwen3.8-27B at group
++        # size 8), each with its own builder, and every step each rebuilt the same metadata --
++        # only the state indices differ by group. Share the group-independent graph buffers
++        # between builders, so the first builder of a step fills them and the rest reuse its
++        # result (see build()). VLLM_GDN_SHARED_BUILD=0 turns it off.
++        self._gdn_shared = os.environ.get("VLLM_GDN_SHARED_BUILD", "1") == "1"
++        if self._gdn_shared:
++            key = (str(device), self.decode_cudagraph_max_bs, self.num_spec)
++            shared = _GDN_SHARED_BUFS.setdefault(key, {
++                "spec_sequence_masks": self.spec_sequence_masks,
++                "spec_token_indx": self.spec_token_indx,
++                "non_spec_token_indx": self.non_spec_token_indx,
++                "spec_query_start_loc": self.spec_query_start_loc,
++                "non_spec_query_start_loc": self.non_spec_query_start_loc,
++                "num_accepted_tokens": self.num_accepted_tokens,
++            })
++            for name, buf in shared.items():
++                setattr(self, name, buf)
+ 
+     def _build_chunk_metadata(
+         self,
+@@ -216,6 +247,32 @@
+         fast_build: bool = False,
+     ) -> GDNAttentionMetadata:
+         m = common_attn_metadata
++        num_accepted_in, draft_cpu_in = num_accepted_tokens, num_decode_draft_tokens_cpu
++        e = _GDN_STEP["entry"]
++        if (
++            self._gdn_shared
++            and e is not None
++            and e["token"] == _GDN_STEP["token"]
++            # same build_attn_metadata() call (token), so the same inputs: the per-builder
++            # kwargs are fresh [:num_reqs] slices of one tensor, hence no identity check
++            and (num_accepted_in is None) == (e["num_accepted"] is None)
++            and e["spec"] == self.kv_cache_spec
++            and e["num_reqs"] == m.num_reqs
++            and e["num_actual_tokens"] == m.num_actual_tokens
++        ):
++            # steady-state spec decode, same step as the group that filled the shared buffers:
++            # only this group's state indices differ.
++            block_table_tensor = mamba_get_block_table_tensor(
++                m.block_table_tensor, m.seq_lens, self.kv_cache_spec,
++                self.vllm_config.cache_config.mamba_cache_mode,
++            )
++            n = e["n"]
++            self.spec_state_indices_tensor[:n].copy_(
++                block_table_tensor[e["spec_mask_cpu"], : self.num_spec + 1], non_blocking=True
++            )
++            ssi = self.spec_state_indices_tensor[: e["batch_size"]]
++            ssi[n:].fill_(NULL_BLOCK_ID)
++            return dataclasses.replace(e["meta"], spec_state_indices_tensor=ssi)
+ 
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+@@ -520,6 +577,21 @@
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+         )
++        if (
++            self._gdn_shared
++            and self.use_full_cuda_graph
++            and num_prefills == 0
++            and num_decodes == 0
++            and 0 < num_spec_decodes <= self.decode_cudagraph_max_bs
++            and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
++            and spec_sequence_masks_cpu is not None
++        ):
++            _GDN_STEP["entry"] = dict(
++                token=_GDN_STEP["token"], num_accepted=num_accepted_in, draft_cpu=draft_cpu_in,
++                spec=self.kv_cache_spec, num_reqs=m.num_reqs, num_actual_tokens=m.num_actual_tokens,
++                spec_mask_cpu=spec_sequence_masks_cpu, n=num_spec_decodes, batch_size=batch_size,
++                meta=attn_metadata,
++            )
+         return attn_metadata
+ 
+     def build_for_cudagraph_capture(
+--- a/v1/worker/gpu/attn_utils.py
++++ b/v1/worker/gpu/attn_utils.py
+@@ -273,6 +273,9 @@
+         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+ 
+     attn_metadata: dict[str, Any] = {}
++    from vllm.v1.attention.backends.gdn_attn import gdn_new_step  # qwen27-dev
++
++    gdn_new_step()
+     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+     for i in range(num_kv_cache_groups):
+         block_table = block_tables[i]
