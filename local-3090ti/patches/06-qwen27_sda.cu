@@ -85,6 +85,7 @@ struct Params {
   const int* seqused; const int* cu_q;
   float* part_o; float* part_m; float* part_l;
   float scale; int Hq, G, qmax, nseg, ntile, QT, window, causal, min_tiles;
+  __nv_bfloat16* out; long stride_ot, stride_oh; int direct;   // direct: nseg == 1, write normalized output
 };
 
 template <int D, int MT>
@@ -1675,6 +1676,27 @@ __global__ void __launch_bounds__(128, 2) sda_partial_v7_kernel(const Params p) 
   }
   cp_async_wait<0>();
 
+  if (p.direct) {
+    // single segment: normalize here and write bf16 output (prefill; no partials, no combine)
+    __syncthreads();
+    if (warp < MT && tig == 0) { alpha_s[r_lo] = l_lo; alpha_s[r_hi] = l_hi; }
+    __syncthreads();
+#pragma unroll
+    for (int a = 0; a < MT; ++a)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int r = a * 16 + gid + h * 8;
+        const int qi = qtile * QT + r / G;
+        if (r < QT * G && qi < q_len) {
+          const float inv = 1.f / fmaxf(alpha_s[r], 1e-30f);
+          __nv_bfloat16* o = p.out + (long)(q_start + qi) * p.stride_ot + (long)(kvh * G + r % G) * p.stride_oh + warp * DW + tig * 2;
+#pragma unroll
+          for (int n = 0; n < NT; ++n)
+            *reinterpret_cast<__nv_bfloat162*>(o + n * 8) = __floats2bfloat162_rn(acc[a][n][h * 2] * inv, acc[a][n][h * 2 + 1] * inv);
+        }
+      }
+    return;
+  }
   if (warp < MT && tig == 0) {
     if (rv_lo) {
       const long pidx = ((long)(req * p.Hq + kvh * G + r_lo % G) * p.qmax + qi_lo) * p.nseg + seg;
@@ -1717,7 +1739,7 @@ static void launch_partial_v7(const Params& p, int num_reqs, int hkv, cudaStream
 // q [T, Hq, D] bf16; kc/vc int8 views [nb, BS, Hkv, D] (head rows D + 4 bytes, scale inline).
 void sda_run(torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor out, torch::Tensor cu_q,
              torch::Tensor seqused, torch::Tensor bt, torch::Tensor part_o, torch::Tensor part_m, torch::Tensor part_l,
-             double scale, int64_t num_reqs, int64_t max_q, int64_t qmax, int64_t nseg, int64_t window, bool causal) {
+             double scale, int64_t num_reqs, int64_t max_q, int64_t qmax, int64_t nseg, int64_t window, bool causal, bool direct) {
   const int Hq = q.size(1), D = q.size(2), Hkv = kc.size(2), G = Hq / Hkv;
   TORCH_CHECK(D == 128 || D == 256, "sda: D must be 128 or 256");
   TORCH_CHECK(kc.stride(3) == 1 && vc.stride(3) == 1 && kc.stride(2) % 4 == 0 && vc.stride(2) % 4 == 0, "sda: head rows must be 4-byte aligned");
@@ -1738,13 +1760,17 @@ void sda_run(torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor 
   p.scale = (float)scale; p.Hq = Hq; p.G = G; p.qmax = (int)qmax; p.nseg = (int)nseg; p.QT = QT;
   p.ntile = ((int)max_q + QT - 1) / QT; p.window = (int)window; p.causal = causal ? 1 : 0;
   { const char* mt = getenv("SDA_MIN_TILES"); p.min_tiles = mt ? atoi(mt) : 4; }
+  p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr()); p.stride_ot = out.stride(0); p.stride_oh = out.stride(1);
+  p.direct = direct ? 1 : 0;
+  if (direct) { p.nseg = 1; TORCH_CHECK(out.stride(2) == 1, "sda: out rows must be contiguous"); }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   // v4 (Q in registers as fp16, 2 CTAs/SM; the caller uses 2x the segments) for both the target's
   // D=256 and the drafter's D=128 layers. SDA_VER=1|3 selects the older variants (tests).
-  const char* ver = getenv("SDA_VER"); const int kv = ver ? atoi(ver) : 7;
+  const char* ver = getenv("SDA_VER"); const int kv = direct ? 7 : (ver ? atoi(ver) : 7);
 #define L(DD, M) if (D == DD && MT == M) { if (kv == 7) launch_partial_v7<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 6) launch_partial_v6<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 5) launch_partial_v5<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 4) launch_partial_v4<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 3) launch_partial_v3<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 2) launch_partial_v2<DD, M>(p, (int)num_reqs, Hkv, stream); else launch_partial<DD, M>(p, (int)num_reqs, Hkv, stream); }
   L(256, 1) L(256, 2) L(256, 3) L(256, 4) L(128, 1) L(128, 2) L(128, 3) L(128, 4)
 #undef L
+  if (direct) return;
   dim3 cgrid((int)num_reqs, Hq, (int)max_q);
   if (D == 256)
     sda_combine_kernel<256><<<cgrid, 256, 0, stream>>>(p.part_o, p.part_m, p.part_l, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), p.cu_q, out.stride(0), out.stride(1), Hq, (int)qmax, (int)nseg, p.seqused, p.window, p.min_tiles);

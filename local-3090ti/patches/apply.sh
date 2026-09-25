@@ -19,3 +19,5 @@ cp 09-qwen27_small_ops.py "$V/model_executor/layers/qwen27_small_ops.py"
 patch -p1 -N -d "$V" < 10-gdn-strided-qkv.patch
 # 11: bf16-cache (CTX=fast) robustness for the split-KV path
 patch -p1 -N -d "$V" < 11-bf16-cache-robustness.patch
+# 12: prefill attention through the CUDA kernel (direct mode)
+patch -p1 -N -d "$V" < 12-prefill-attention-cuda.patch

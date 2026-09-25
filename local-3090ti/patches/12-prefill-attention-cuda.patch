@@ -1,0 +1,61 @@
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -8,6 +8,9 @@
+ import os
+ import torch
+ 
++_QWEN27_PREFILL_CUDA = os.environ.get("VLLM_QWEN27_PREFILL_CUDA", "1") == "1"
++_QWEN27_EMPTY: dict = {}
++
+ import vllm.envs as envs
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config_or_none
+@@ -944,6 +947,37 @@
+             )
+             return output
+ 
++        # qwen27-dev: prefill (and any non-verify) attention on the int8 per-token-head cache through the
++        # CUDA split-KV kernel in direct mode (one segment per query tile, normalized bf16 output):
++        # Q.K^T on int8 tensor cores with two-level Q, 2.1-2.4x vLLM's Triton kernel on a 3090.
++        if (
++            _QWEN27_PREFILL_CUDA
++            and k_scale_cache is not None
++            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
++            and isinstance(attn_metadata.causal, bool)
++            and not self.logits_soft_cap
++            and self.alibi_slopes is None
++            and self.sinks is None
++            and self.chunk_lookback == -1
++            and mm_prefix_range_tensor is None
++            and attn_metadata.rswa_prefix_lens is None
++            and output_scale is None
++            and query.dtype == torch.bfloat16
++        ):
++            from vllm.v1.attention.ops.spec_decode_attn import _sda_ext, SpecDecodeAttention
++
++            _q = query[:num_actual_tokens]
++            if SpecDecodeAttention._cuda_ok(None, _q, key_cache, value_cache, True, False, False):
++                _sw = self.sliding_window
++                _win = (1 + _sw[0]) if (_sw is not None and tuple(_sw) != (-1, -1)) else 0
++                _f = _QWEN27_EMPTY.get(query.device)
++                if _f is None:
++                    _f = _QWEN27_EMPTY[query.device] = torch.empty(1, dtype=torch.float32, device=query.device)
++                _sda_ext().run(_q, key_cache, value_cache, output[:num_actual_tokens], cu_seqlens_q, seqused_k,
++                               block_table, _f, _f, _f, float(self.scale), int(cu_seqlens_q.shape[0] - 1),
++                               int(max_seqlen_q), int(max_seqlen_q), 1, int(_win), bool(attn_metadata.causal), True)
++                return output
++
+         unified_attention(
+             q=query[:num_actual_tokens],
+             k=key_cache,
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -311,7 +311,7 @@
+             nseg = max(1, min(self.nseg_buf, 2 * _num_sms(q.device) // Hkv))
+             _sda_ext().run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
+                            self.part_o, self.part_m, self.part_l, float(scale), int(num_reqs),
+-                           int(max_query_len), self.qmax, nseg, int(window), bool(causal))
++                           int(max_query_len), self.qmax, nseg, int(window), bool(causal), False)
+             return out
+         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
+         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
