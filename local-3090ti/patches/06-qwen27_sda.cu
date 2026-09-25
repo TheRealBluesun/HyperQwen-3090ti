@@ -68,6 +68,16 @@ __device__ __forceinline__ unsigned pack_f16(float lo, float hi) {
   return *reinterpret_cast<unsigned*>(&r);
 }
 
+__device__ __forceinline__ void mma_s8(int* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned pack_s8x4(int a, int b, int c, int d) {
+  return (unsigned)(a & 0xff) | ((unsigned)(b & 0xff) << 8) | ((unsigned)(c & 0xff) << 16) | ((unsigned)(d & 0xff) << 24);
+}
+
 struct Params {
   const __nv_bfloat16* q; long stride_qt, stride_qh;
   const unsigned char* k; const unsigned char* v; long stride_kb, stride_ks, stride_kh, stride_vb, stride_vs, stride_vh;
@@ -1439,6 +1449,271 @@ static void launch_partial_v6(const Params& p, int num_reqs, int hkv, cudaStream
   sda_partial_v6_kernel<D, MT><<<grid, 128, smem, stream>>>(p);
 }
 
+// v7 = v6 with Q.K^T on int8 tensor cores: Q split per row into two int8 levels (q ~ s*q_hi + s/256*q_lo, ~15-bit), raw int8 K as B (no conversion), exact int32 accumulation: // v2: Q lives in registers (each warp holds its D/4 slice of every row as mma A fragments, loaded
+// once); Q.K^T is split along D across the 4 warps and the partial scores are summed with
+// shared-memory float atomics. ~45 KB of shared memory at D=256, so two CTAs fit on an SM.
+template <int D, int MT>
+__global__ void __launch_bounds__(128, 2) sda_partial_v7_kernel(const Params p) {
+  constexpr int ROWS = MT * 16;
+  constexpr int KVCH = D / 16 + 1, KVSTR = KVCH * 16;
+  constexpr int SSTR = TK + 1, PSTR = TK + 8;
+  constexpr int DW = D / 4, NT = DW / 8, KS = D / 16;    // PV: per-warp head-dim slice; QK: full-D k16 steps
+  extern __shared__ __align__(16) unsigned char smem[];
+  unsigned char* KVs = smem;                                             // 2 stages x (K, V)
+  __nv_bfloat16* Ps = reinterpret_cast<__nv_bfloat16*>(KVs + 4 * TK * KVSTR);
+  float* alpha_s = reinterpret_cast<float*>(Ps + ROWS * PSTR);
+
+  const int req = blockIdx.x / p.ntile, qtile = blockIdx.x % p.ntile;
+  const int kvh = blockIdx.y, seg = blockIdx.z;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+  const int q_start = p.cu_q[req], q_len = p.cu_q[req + 1] - q_start;
+  const int kv_len = p.seqused[req];
+  const int G = p.G, QT = p.QT;
+  if (qtile * QT >= q_len) return;
+
+  // Q A-fragments: warp w owns row tile w (rows w*16 .. w*16+15) over the full head dim.
+  constexpr int KC = D / 32;
+  unsigned qh[KC][4], ql[KC][4];
+  float qsc[2];   // per-row scale of rows gid / gid+8 of this warp's tile (q_hi units)
+  {
+    const int mw0 = warp < MT ? warp : 0;
+    float qv[2][KC][8];
+    float amax[2] = {0.f, 0.f};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int r = mw0 * 16 + gid + h * 8;
+      const int qi = qtile * QT + r / G;
+      const bool rv = warp < MT && (r < QT * G) && (qi < q_len);
+      const __nv_bfloat16* qrow = p.q + (long)(q_start + qi) * p.stride_qt + (long)(kvh * G + r % G) * p.stride_qh;
+#pragma unroll
+      for (int c = 0; c < KC; ++c)
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+          if (rv) {
+            const uint2 w = *reinterpret_cast<const uint2*>(qrow + c * 32 + half * 16 + tig * 4);
+            const __nv_bfloat162 a01 = *reinterpret_cast<const __nv_bfloat162*>(&w.x), a23 = *reinterpret_cast<const __nv_bfloat162*>(&w.y);
+            f = make_float4(__bfloat162float(a01.x), __bfloat162float(a01.y), __bfloat162float(a23.x), __bfloat162float(a23.y));
+          }
+          qv[h][c][half * 4 + 0] = f.x; qv[h][c][half * 4 + 1] = f.y; qv[h][c][half * 4 + 2] = f.z; qv[h][c][half * 4 + 3] = f.w;
+          amax[h] = fmaxf(amax[h], fmaxf(fmaxf(fabsf(f.x), fabsf(f.y)), fmaxf(fabsf(f.z), fabsf(f.w))));
+        }
+      amax[h] = fmaxf(amax[h], __shfl_xor_sync(0xffffffff, amax[h], 1));
+      amax[h] = fmaxf(amax[h], __shfl_xor_sync(0xffffffff, amax[h], 2));
+      qsc[h] = amax[h] > 0.f ? amax[h] / 127.f : 1.f;
+    }
+#pragma unroll
+    for (int c = 0; c < KC; ++c)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        int hi[8], lo[8];
+        const float inv = 1.f / qsc[h];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const float x = qv[h][c][e] * inv;
+          const float xh = rintf(x);
+          hi[e] = (int)xh;
+          lo[e] = max(-127, min(127, (int)rintf((x - xh) * 256.f)));
+        }
+        qh[c][h] = pack_s8x4(hi[0], hi[1], hi[2], hi[3]); qh[c][2 + h] = pack_s8x4(hi[4], hi[5], hi[6], hi[7]);
+        ql[c][h] = pack_s8x4(lo[0], lo[1], lo[2], lo[3]); ql[c][2 + h] = pack_s8x4(lo[4], lo[5], lo[6], lo[7]);
+      }
+  }
+  const int mw = warp < MT ? warp : 0;
+
+  const int tiles_total = (kv_len + TK - 1) / TK;
+  int t_lo = 0;
+  if (p.window > 0) { int lo = kv_len - q_len - p.window + 1; t_lo = lo > 0 ? lo / TK : 0; }
+  // Use only as many segments as the context needs (>= p.min_tiles tiles each): every live segment
+  // costs a D-float partial per row, written here and re-read by the combine. Idle CTAs exit.
+  const int nseg_eff = min(p.nseg, max(1, (tiles_total - t_lo + p.min_tiles - 1) / p.min_tiles));
+  if (seg >= nseg_eff) return;
+  const int per = (tiles_total - t_lo + nseg_eff - 1) / nseg_eff;
+  const int t0 = t_lo + seg * per, t1 = min(t0 + per, tiles_total);
+
+  const unsigned char* khead = p.k + (long)kvh * p.stride_kh;
+  const unsigned char* vhead = p.v + (long)kvh * p.stride_vh;
+  const int kshift = (int)((uintptr_t)khead & 15), vshift = (int)((uintptr_t)vhead & 15);
+  khead -= kshift; vhead -= vshift;
+  const int kbytes = kshift + D + 4, vbytes = vshift + D + 4;
+  auto load_tile = [&](int t, int st) {
+    const int pos0 = t * TK;
+    const long blk = p.bt[req * p.stride_bt + pos0 / p.BS];
+    const int slot0 = pos0 % p.BS;
+    const unsigned char* kb = khead + blk * p.stride_kb + (long)slot0 * p.stride_ks;
+    const unsigned char* vb = vhead + blk * p.stride_vb + (long)slot0 * p.stride_vs;
+    unsigned char* ks = KVs + (st * 2) * TK * KVSTR;
+    unsigned char* vs = KVs + (st * 2 + 1) * TK * KVSTR;
+    for (int i = tid; i < TK * KVCH; i += 128) {
+      const int key = i / KVCH, ch = i % KVCH;
+      const bool ok = pos0 + key < kv_len;
+      const int kn = ok ? min(16, max(0, kbytes - ch * 16)) : 0;
+      const int vn = ok ? min(16, max(0, vbytes - ch * 16)) : 0;
+      cp_async16(ks + key * KVSTR + ch * 16, kb + (long)key * p.stride_ks + ch * 16, kn);
+      cp_async16(vs + key * KVSTR + ch * 16, vb + (long)key * p.stride_vs + ch * 16, vn);
+    }
+  };
+
+  float acc[MT][NT][4];
+#pragma unroll
+  for (int a = 0; a < MT; ++a)
+#pragma unroll
+    for (int b = 0; b < NT; ++b) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
+  float m_lo = -INFINITY, m_hi = -INFINITY, l_lo = 0.f, l_hi = 0.f;   // rows mw*16+gid and +8
+  const int r_lo = mw * 16 + gid, r_hi = r_lo + 8;
+  const int qi_lo = qtile * QT + r_lo / G, qi_hi = qtile * QT + r_hi / G;
+  const bool rv_lo = warp < MT && r_lo < QT * G && qi_lo < q_len;
+  const bool rv_hi = warp < MT && r_hi < QT * G && qi_hi < q_len;
+  const int qpos_lo = kv_len - q_len + qi_lo, qpos_hi = kv_len - q_len + qi_hi;
+
+  if (t0 < t1) load_tile(t0, 0);
+  cp_async_commit();
+  for (int t = t0; t < t1; ++t) {
+    const int st = (t - t0) & 1;
+    // Tile t is the only copy in flight: wait for it, then barrier -- which also guarantees every
+    // warp is done with tile t-1 (its V in stage st^1) -- and only then start filling stage st^1.
+    cp_async_wait<0>();
+    __syncthreads();
+    if (t + 1 < t1) load_tile(t + 1, st ^ 1);
+    cp_async_commit();
+    const unsigned char* ks = KVs + (st * 2) * TK * KVSTR + kshift;
+    const unsigned char* vs = KVs + (st * 2 + 1) * TK * KVSTR + vshift;
+
+    // ---- S rows of this warp's row tile, all TK keys, full head dim
+    if (warp < MT) {
+      int ah[TK / 8][4], al[TK / 8][4];
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { ah[n][e] = 0; al[n][e] = 0; }
+      const unsigned char* kr = ks + gid * KVSTR + tig * 4;
+#pragma unroll
+      for (int c = 0; c < KC; ++c) {
+#pragma unroll
+        for (int n = 0; n < TK / 8; ++n) {
+          const unsigned b0 = *reinterpret_cast<const unsigned*>(kr + n * 8 * KVSTR + c * 32);
+          const unsigned b1 = *reinterpret_cast<const unsigned*>(kr + n * 8 * KVSTR + c * 32 + 16);
+          mma_s8(ah[n], qh[c][0], qh[c][1], qh[c][2], qh[c][3], b0, b1);
+          mma_s8(al[n], ql[c][0], ql[c][1], ql[c][2], ql[c][3], b0, b1);
+        }
+      }
+      float sacc[TK / 8][4];
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n) {
+        sacc[n][0] = ((float)ah[n][0] + (float)al[n][0] * (1.f / 256.f)) * qsc[0];
+        sacc[n][1] = ((float)ah[n][1] + (float)al[n][1] * (1.f / 256.f)) * qsc[0];
+        sacc[n][2] = ((float)ah[n][2] + (float)al[n][2] * (1.f / 256.f)) * qsc[1];
+        sacc[n][3] = ((float)ah[n][3] + (float)al[n][3] * (1.f / 256.f)) * qsc[1];
+      }
+      // scale + mask in registers; this thread holds keys n*8 + tig*2 + {0,1} of rows r_lo / r_hi
+      float mx_lo = -INFINITY, mx_hi = -INFINITY;
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const int key = n * 8 + tig * 2 + j, pos = t * TK + key;
+          const float ksc = *reinterpret_cast<const float*>(ks + key * KVSTR + D) * p.scale;
+          bool ok_lo = rv_lo && pos < kv_len, ok_hi = rv_hi && pos < kv_len;
+          if (p.causal) { ok_lo = ok_lo && pos <= qpos_lo; ok_hi = ok_hi && pos <= qpos_hi; }
+          if (p.window > 0) {
+            ok_lo = ok_lo && (qpos_lo - pos < p.window) && (p.causal || pos - qpos_lo < p.window);
+            ok_hi = ok_hi && (qpos_hi - pos < p.window) && (p.causal || pos - qpos_hi < p.window);
+          }
+          sacc[n][j] = ok_lo ? sacc[n][j] * ksc : -INFINITY;
+          sacc[n][2 + j] = ok_hi ? sacc[n][2 + j] * ksc : -INFINITY;
+          mx_lo = fmaxf(mx_lo, sacc[n][j]); mx_hi = fmaxf(mx_hi, sacc[n][2 + j]);
+        }
+      mx_lo = fmaxf(mx_lo, __shfl_xor_sync(0xffffffff, mx_lo, 1)); mx_lo = fmaxf(mx_lo, __shfl_xor_sync(0xffffffff, mx_lo, 2));
+      mx_hi = fmaxf(mx_hi, __shfl_xor_sync(0xffffffff, mx_hi, 1)); mx_hi = fmaxf(mx_hi, __shfl_xor_sync(0xffffffff, mx_hi, 2));
+      const float mn_lo = fmaxf(m_lo, mx_lo), mn_hi = fmaxf(m_hi, mx_hi);
+      const float ms_lo = mn_lo == -INFINITY ? 0.f : mn_lo, ms_hi = mn_hi == -INFINITY ? 0.f : mn_hi;
+      const float al_lo = m_lo == -INFINITY ? 0.f : __expf(m_lo - ms_lo), al_hi = m_hi == -INFINITY ? 0.f : __expf(m_hi - ms_hi);
+      float sum_lo = 0.f, sum_hi = 0.f;
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n) {
+        const int key = n * 8 + tig * 2;
+        const float vs0 = *reinterpret_cast<const float*>(vs + key * KVSTR + D);
+        const float vs1 = *reinterpret_cast<const float*>(vs + (key + 1) * KVSTR + D);
+        const float p0 = __expf(sacc[n][0] - ms_lo), p1 = __expf(sacc[n][1] - ms_lo);
+        const float p2 = __expf(sacc[n][2] - ms_hi), p3 = __expf(sacc[n][3] - ms_hi);
+        sum_lo += p0 + p1; sum_hi += p2 + p3;
+        *reinterpret_cast<__nv_bfloat162*>(Ps + r_lo * PSTR + key) = __floats2bfloat162_rn(p0 * vs0, p1 * vs1);
+        *reinterpret_cast<__nv_bfloat162*>(Ps + r_hi * PSTR + key) = __floats2bfloat162_rn(p2 * vs0, p3 * vs1);
+      }
+      sum_lo += __shfl_xor_sync(0xffffffff, sum_lo, 1); sum_lo += __shfl_xor_sync(0xffffffff, sum_lo, 2);
+      sum_hi += __shfl_xor_sync(0xffffffff, sum_hi, 1); sum_hi += __shfl_xor_sync(0xffffffff, sum_hi, 2);
+      l_lo = l_lo * al_lo + sum_lo; l_hi = l_hi * al_hi + sum_hi;
+      m_lo = mn_lo; m_hi = mn_hi;
+      if (tig == 0) { alpha_s[r_lo] = al_lo; alpha_s[r_hi] = al_hi; }
+    }
+    __syncthreads();
+
+    // ---- O[:, this warp's dims] = alpha * O + P' V
+#pragma unroll
+    for (int a = 0; a < MT; ++a) {
+      const float al = alpha_s[a * 16 + gid], ah = alpha_s[a * 16 + gid + 8];
+#pragma unroll
+      for (int n = 0; n < NT; ++n) { acc[a][n][0] *= al; acc[a][n][1] *= al; acc[a][n][2] *= ah; acc[a][n][3] *= ah; }
+    }
+    const unsigned char* vcol = vs + warp * DW + gid;
+#pragma unroll
+    for (int kk = 0; kk < TK / 16; ++kk) {
+      unsigned af[MT][4];
+#pragma unroll
+      for (int a = 0; a < MT; ++a)
+        ldmatrix_x4(af[a][0], af[a][1], af[a][2], af[a][3], Ps + (a * 16 + (lane & 15)) * PSTR + kk * 16 + (lane >> 4) * 8);
+      const int k0 = kk * 16 + tig * 2;
+#pragma unroll
+      for (int n = 0; n < NT; ++n) {
+        const unsigned char* vc = vcol + n * 8;
+        const unsigned b0 = pack_bf16((float)(signed char)vc[k0 * KVSTR], (float)(signed char)vc[(k0 + 1) * KVSTR]);
+        const unsigned b1 = pack_bf16((float)(signed char)vc[(k0 + 8) * KVSTR], (float)(signed char)vc[(k0 + 9) * KVSTR]);
+#pragma unroll
+        for (int a = 0; a < MT; ++a) mma_bf16(acc[a][n], af[a][0], af[a][1], af[a][2], af[a][3], b0, b1);
+      }
+    }
+  }
+  cp_async_wait<0>();
+
+  if (warp < MT && tig == 0) {
+    if (rv_lo) {
+      const long pidx = ((long)(req * p.Hq + kvh * G + r_lo % G) * p.qmax + qi_lo) * p.nseg + seg;
+      p.part_m[pidx] = m_lo; p.part_l[pidx] = l_lo;
+    }
+    if (rv_hi) {
+      const long pidx = ((long)(req * p.Hq + kvh * G + r_hi % G) * p.qmax + qi_hi) * p.nseg + seg;
+      p.part_m[pidx] = m_hi; p.part_l[pidx] = l_hi;
+    }
+  }
+#pragma unroll
+  for (int a = 0; a < MT; ++a)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int r = a * 16 + gid + h * 8;
+      const int qi = qtile * QT + r / G;
+      if (r < QT * G && qi < q_len) {
+        const long pidx = ((long)(req * p.Hq + kvh * G + r % G) * p.qmax + qi) * p.nseg + seg;
+        float* o = p.part_o + pidx * D + warp * DW + tig * 2;
+#pragma unroll
+        for (int n = 0; n < NT; ++n) *reinterpret_cast<float2*>(o + n * 8) = make_float2(acc[a][n][h * 2], acc[a][n][h * 2 + 1]);
+      }
+    }
+}
+
+
+
+
+
+template <int D, int MT>
+static void launch_partial_v7(const Params& p, int num_reqs, int hkv, cudaStream_t stream) {
+  constexpr int ROWS = MT * 16;
+  const int smem = 4 * TK * (D / 16 + 1) * 16 + ROWS * (TK + 8) * 2 + ROWS * 4;
+  static bool attr = false;
+  if (!attr) { cudaFuncSetAttribute(sda_partial_v7_kernel<D, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+  dim3 grid(num_reqs * p.ntile, hkv, p.nseg);
+  sda_partial_v7_kernel<D, MT><<<grid, 128, smem, stream>>>(p);
+}
+
 // q [T, Hq, D] bf16; kc/vc int8 views [nb, BS, Hkv, D] (head rows D + 4 bytes, scale inline).
 void sda_run(torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor out, torch::Tensor cu_q,
              torch::Tensor seqused, torch::Tensor bt, torch::Tensor part_o, torch::Tensor part_m, torch::Tensor part_l,
@@ -1466,8 +1741,8 @@ void sda_run(torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   // v4 (Q in registers as fp16, 2 CTAs/SM; the caller uses 2x the segments) for both the target's
   // D=256 and the drafter's D=128 layers. SDA_VER=1|3 selects the older variants (tests).
-  const char* ver = getenv("SDA_VER"); const int kv = ver ? atoi(ver) : 6;
-#define L(DD, M) if (D == DD && MT == M) { if (kv == 6) launch_partial_v6<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 5) launch_partial_v5<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 4) launch_partial_v4<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 3) launch_partial_v3<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 2) launch_partial_v2<DD, M>(p, (int)num_reqs, Hkv, stream); else launch_partial<DD, M>(p, (int)num_reqs, Hkv, stream); }
+  const char* ver = getenv("SDA_VER"); const int kv = ver ? atoi(ver) : 7;
+#define L(DD, M) if (D == DD && MT == M) { if (kv == 7) launch_partial_v7<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 6) launch_partial_v6<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 5) launch_partial_v5<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 4) launch_partial_v4<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 3) launch_partial_v3<DD, M>(p, (int)num_reqs, Hkv, stream); else if (kv == 2) launch_partial_v2<DD, M>(p, (int)num_reqs, Hkv, stream); else launch_partial<DD, M>(p, (int)num_reqs, Hkv, stream); }
   L(256, 1) L(256, 2) L(256, 3) L(256, 4) L(128, 1) L(128, 2) L(128, 3) L(128, 4)
 #undef L
   dim3 cgrid((int)num_reqs, Hq, (int)max_q);
