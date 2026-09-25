@@ -14,3 +14,16 @@ _TABLE = {
 
 def table():
     return dict(_TABLE)
+
+
+# 8 < M <= 16 (two concurrent verify blocks); only entries >3% over the default (run-to-run noise ~1.5%)
+_TABLE16 = {
+    (5120, 17408): (128, 128, 80),   # down                65.4 -> 60.4 us
+    (5120, 6144): (128, 128, 80),    # o_proj              26.7 -> 25.9 us
+    (5120, 4096): (128, 64, 80),     # drafter o_proj      19.9 -> 17.9 us
+    (6144, 5120): (128, 128, 74),    # drafter qkv         27.7 -> 26.7 us
+}
+
+
+def table16():
+    return dict(_TABLE16)

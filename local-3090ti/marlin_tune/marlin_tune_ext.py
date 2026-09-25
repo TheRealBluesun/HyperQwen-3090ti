@@ -13,6 +13,7 @@ import torch
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marlin_tune_src")
 _TABLE: dict = {}
+_TABLE16: dict = {}   # 8 < M <= 16 (two concurrent verify blocks)
 _EXT = None
 _CTMP = {}
 _U4B8 = None
@@ -48,18 +49,26 @@ def _load():
 
 
 def set_table(table: dict) -> None:
-    """table: {(size_n, size_k): (thread_k, thread_n, sms)} for M<=8 (a bare int = sms, stock tiles)."""
+    """table: {(size_n, size_k): (thread_k, thread_n, sms)} for M<=8 (a bare int = sms, stock tiles).
+    marlin_best.table16() (if present) gives the same for 8 < M <= 16."""
     _TABLE.clear()
     _TABLE.update(table)
+    try:
+        import marlin_best
+
+        _TABLE16.clear()
+        _TABLE16.update(getattr(marlin_best, "table16", dict)())
+    except ImportError:
+        pass
     _load()
 
 
 def _impl(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm, workspace,
           b_type_id, size_m, size_n, size_k, is_k_full=True, use_atomic_add=False, use_fp32_reduce=False,
           is_zp_float=False):
-    cfg = _TABLE.get((size_n, size_k))
+    cfg = (_TABLE if size_m <= 8 else _TABLE16).get((size_n, size_k))
     tk, tn, sms = (cfg if isinstance(cfg, tuple) else (-1, -1, cfg)) if cfg is not None else (-1, -1, None)
-    if (sms is not None and size_m <= 8 and b_type_id == _U4B8 and a.dtype == torch.bfloat16
+    if (sms is not None and size_m <= 16 and b_type_id == _U4B8 and a.dtype == torch.bfloat16
             and b_scales.dtype == torch.bfloat16 and b_scales.size(0) * 128 == size_k
             and b_bias is None and a_scales is None and global_scale is None
             and (b_zeros is None or b_zeros.numel() == 0) and (g_idx is None or g_idx.numel() == 0)
