@@ -171,3 +171,15 @@ contiguous there; the real copy is one fused inductor kernel).
 | v7 (two-level int8 Q, s8 MMA Q.K^T) | 355 | 221 | 26.10 / 29.18 |
 v7: 121K decode 94 tok/s (61 at the start of the night); short context unchanged (22.92 ms/step); valid JSON 12/12;
 needles at 100K@10%/90% retrieved. Error vs fp32 reference unchanged (~2.4e-3).
+
+### Night of 09-25: prefill attention in CUDA (#12)
+The v7 kernel in direct mode (one segment per query tile, normalized bf16 output) replaces vLLM's Triton
+unified_attention for all non-verify attention on the int8 cache: 64-67 TFLOP/s effective vs 31 (2.1-2.4x).
+| ctx (uncached prompt) | TTFT before -> now | prefill tok/s |
+|---|---|---|
+| 18K | 15.5 -> 14.3 s | 1,146 -> 1,242 |
+| 34K | 33.3 -> 28.9 s | 1,008 -> 1,164 |
+| 63K | 76.9 -> 60.7 s | 824 -> 1,044 |
+| 121K | 199 -> 139 s | 609 -> 873 |
+Checks: replay valid JSON 12/12, needles 30K@50% + 100K@10/50/90% retrieved, GSM8K 200 95.5% (96.0% before).
+Prefill is now GEMM-bound (Marlin at the bf16 tensor peak); the remaining lever there is INT8_ACT (quality trade).

@@ -59,10 +59,10 @@ buffer sizing (#04, 1.9 GB freed), GDN metadata once per step (#07), Marlin M<=8
 silu_and_mul (#09), GDN q/k/v in place (#10). Retain decode 24.87 -> 23.06 ms/step; 121K decode 61 -> 84 tok/s.
 Not yet on :8001 (the deployed venv has #01-#04 only).
 Remaining, by expected value:
-1. Verify attention v5: the kernel is now CUDA-core bound (int8->fp conversions, masking, softmax, rescale:
+1. (done as v6/v7: 3.3x the Triton kernel at 110K) Verify attention v5: the kernel is now CUDA-core bound (int8->fp conversions, masking, softmax, rescale:
    ~14x the tensor instructions). Skip the rescale when no row max changed, a no-mask fast path for interior
    tiles, int8->bf16 via PRMT+FADD instead of I2F. Est. 538 -> ~420 us/layer at 110K (~+5% decode at 121K).
 2. A W4A16 GEMV for M<=16 that reads Marlin's packed layout but gives each CTA whole column tiles (no cross-CTA
    split-K, K split across warps in the CTA): the only route to the ~2 ms/step Marlin gap (~8% at short context).
 3. DFLASH_TOKENS>7 correctness on CTX=long (the lookup tail is worth up to ~+10% tok/step on copy-heavy JSON).
-4. Prefill attention (int8 KV) in CUDA for long prompts: attention is ~50% of a 121K prefill (198 s).
+4. (done: #12, 121K prefill 199 -> 139 s) Prefill is now GEMM-bound at the bf16 tensor peak; INT8_ACT is the lever.
