@@ -51,3 +51,17 @@ Versus the old llama.cpp EXL3 setup: ~1.6–2.3x on typical prompts; 109K ready 
 - Marlin knobs: use_fp32_reduce no effect; atomic-add reduce not applicable (N ≥ 2048, bf16 on sm8x).
 - Fusing kernels to cut launch gaps (as a fix for GEMMs slower in-server than isolated): the gap was power
   throttling, fixed by 350 W.
+
+
+## Update after the night of 09-25 (dev tree on :8002; see PROGRESS.md)
+Done: verify attention in CUDA (#06: 2.2x at 110K, drafter 2.3x), V2 sampler small-k (#03), split-KV drafter +
+buffer sizing (#04, 1.9 GB freed), GDN metadata once per step (#07). Retain decode 24.87 -> 24.13 ms/step;
+121K decode 61 -> 82 tok/s. Not yet on :8001 (the deployed venv has #01-#04 only).
+Remaining, by expected value:
+1. Verify attention v5: the kernel is now CUDA-core bound (int8->fp conversions, masking, softmax, rescale:
+   ~14x the tensor instructions). Skip the rescale when no row max changed, a no-mask fast path for interior
+   tiles, int8->bf16 via PRMT+FADD instead of I2F. Est. 538 -> ~420 us/layer at 110K (~+5% decode at 121K).
+2. A W4A16 GEMV for M<=16 that reads Marlin's packed layout but gives each CTA whole column tiles (no cross-CTA
+   split-K, K split across warps in the CTA): the only route to the ~2 ms/step Marlin gap (~8% at short context).
+3. DFLASH_TOKENS>7 correctness on CTX=long (the lookup tail is worth up to ~+10% tok/step on copy-heavy JSON).
+4. Prefill attention (int8 KV) in CUDA for long prompts: attention is ~50% of a 121K prefill (198 s).

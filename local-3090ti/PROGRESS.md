@@ -71,3 +71,71 @@ efficiency ~2.8 ms, small kernels ~4.2 ms, idle ~1.1 ms.
 Deep context: decode @109K 42.2 ms/step = verify attention 17.9 (reads ~3.6 GB int8 KV per step → ~21% of
 bandwidth; compute floor ~5–6 ms) + GEMMs 19.1 + other 4.8 + idle 0.3. 109K prefill 166 s = attention 87 s
 (~27 TFLOP/s, ~38% of the 3090's ~71 TFLOP/s bf16 tensor peak) + GEMMs 74 s (~72 TFLOP/s: at peak).
+
+## Decode on memory-service-shaped traffic (09-25, :8002 / RTX 3090 @ 350 W)
+Workload: the memory service's fact-extraction calls, rebuilt with its own prompt builder (fixed ~3K-token
+system prompt, ~750-token conversation chunk, `response_format: json_object`, T=0.1; model defaults
+top_k=20 / top_p=0.95). Synthetic conversations. ~4K context, pure decode. `memory-service/run_workload.py`.
+
+| Step | ms/step | decode (12 req) | tok/step | Notes |
+|---|---|---|---|---|
+| baseline | 26.21 | 232 tok/s | 6.04 | JSON grammar costs 0.57 ms/step (nofmt: 25.64) |
+| + #03 V2 sampler passes k_max | 25.56 | 236 | 6.00 | Triton top-k/top-p 813 us/step -> sort-free torch.topk |
+| + #04 split-KV drafter attention | 24.93 | 241 | 5.96 | drafter's 5 non-causal 2048-window layers: 170-180 -> 58 us each |
+| greedy A/B of #04 (SWA=0 vs 1) | 25.20 -> 24.73 | 242 -> 247 | 6.06 / 6.05 | acceptance identical at every position |
+
+#04 also fixes split-KV buffer sizing: the vLLM config is never set during forward, so the buffers were
+sized for a 256-request fallback (1,935 MiB for the target). Primed from TritonAttentionImpl.__init__ now:
+30 MiB (target) + 20 MiB (drafter); ~1.9 GB freed per card after load.
+Other findings: two concurrent retains give 227 tok/s aggregate (no gain over one); acceptance on this
+workload is high (0.91 ... 0.56 by draft position, ~6 tokens/step); two full-vocab int4 lm_head passes per
+step (drafter candidates + target) = 1.5 ms; per-step Marlin 19.2 ms.
+
+## Night of 09-25: dev tree on :8002 (RTX 3090 @ 350 W)
+Dev overlay: a copy of the vllm package loaded via PYTHONPATH by a transient unit (`deploy/dev_up.sh`), so
+the deployed venv is untouched. Standard check = `nightbench.sh` (retain replay as sent + greedy, greedy chat)
++ greedy-output comparison against a k=7 reference (run-to-run identical at k=7).
+
+Measured / tried:
+- Decode is power-capped: 344 W, SM ~1,800 MHz (throttle 0x4), memory 9,501 MHz (CUDA P2 cap; -lmc 9751 is
+  ignored). Streaming read ceiling on this card at 350 W: ~825-840 GB/s. SM locked at 1,500 MHz: 257 W, +5% step.
+- Big Marlin GEMMs run at 93-94% of that ceiling; lm_head ~100%; GDN out_proj ~74%.
+- DFLASH_TOKENS=11 at 128K (fits after the buffer fix, 5.5 GiB pool): output CORRUPT ("restarts every 1/its user
+  session"), adaptive and pinned verify length, with and without patch 04. Pre-existing bug in the >7-token
+  path on CTX=long; parked.
+- Drafter 40,960-token candidate head (reusing mtp.draft_lm_head.*): -0.76 ms/step but tok/step 6.05 -> 5.74
+  on retain (the vocab misses copied names/paths) = -2.4% net. Rejected.
+- int8 Q.K^T in the verify kernel: +15% only and 16x the error with outlier q channels. Rejected.
+  fp16-accumulate P.V: no gain. Triton config sweeps: plateau ~15%.
+
+Verify attention in CUDA (`qwen27_sda.cu`, JIT-built; Nsight showed the Triton kernel at 1 CTA/SM, 254 regs,
+1.56 waves, DRAM 18%). v1: 4 warps, 32-key tiles, 16-byte cp.async double buffering of 4-byte-aligned head
+rows (K/V interleave per head), key-split QK, D-split PV. v3: Q in registers, row-tile QK, ~45 KB smem ->
+2 CTAs/SM, 2x segments. Target 110K: 1,176 -> 552 us/layer; 64K 710 -> 333; 4K 64 -> 49. Drafter (v1): 56 -> 25 us.
+Same error as the Triton kernel (rel ~2.4e-3 vs fp32 reference); greedy retain outputs valid JSON 12/12.
+
+| Test (:8002, dev) | before tonight | + CUDA verify attention |
+|---|---|---|
+| retain greedy tok/s (ms/step) | 245.5 (24.87) | 250.3 (24.29) |
+| decode @ 34K / 63K / 121K tok/s | 94 / 78 / 61 | 107 / 98.5 / 82 |
+| ms/step @ 34K / 63K / 121K | 30.0 / 34.9 / 44.0 | 26.6 / 28.9 / 33.5 |
+
+### Night of 09-25, continued (all on :8002 dev, RTX 3090 @ 350 W)
+| Change | retain greedy ms/step (tok/s) | long-context decode | Notes |
+|---|---|---|---|
+| start of night (patches 01-04) | 24.87 (245.5) | 94 / 78 / 61 tok/s @ 34K/63K/121K | |
+| #06 CUDA verify attention v1/v3 | 24.29 (250.3) | 107 / 98.5 / 82 | per layer @110K 1,176 -> 552 us |
+| #06 race fix + v4 (fp16 Q.K^T) + adaptive segments | 24.29 (249.3) | 28.7 ms/step @63K, 33.1 @121K | 110K 538 us; 4K 51 -> 43 us |
+| #07 GDN metadata built once per step (6 groups) | 24.13 (250.7) | - | outputs identical 12/12 |
+
+Measured and rejected tonight (details in NOTES.md):
+- Stock Marlin at M=8 is at 90-95% of the card's ~865 GB/s ceiling on the big matrices, 70% on the 16 MB o_proj.
+  A standalone build of vLLM 0.29's Marlin (bit-identical output) with explicit thread_k/thread_n/sms: no config
+  beats the default; 2-3 CTAs/SM is slower. The ~2 ms/step gap is Marlin's split-K scheduling, not its tiles.
+- GDN recurrent update: the 8 per-token state writes cost only ~6.6 of 22.7 us/layer; the rest is the sequential
+  recurrence. A replay/materialize redesign would save ~0.13 ms/step. Launch-config sweep: best -8%.
+- CPU energy-performance preference (performance vs balance_performance): no difference.
+- INT8_ACT=int8 (W4A8): retain TTFT 1.06 -> 0.56 s, but decode +5.8% ms/step (the W4A8 path covers the decode
+  GEMMs too; weights are repacked for it) and greedy outputs diverge from W4A16 early (upstream: ppl +4.1%).
+  Net ~-6% per memory-service request; left off, the user's call.
+- DFLASH_TOKENS>7 at CTX=long: corrupt output (not caused by our patches; the GDN state-slot count is right).
