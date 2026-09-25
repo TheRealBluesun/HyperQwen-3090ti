@@ -83,9 +83,9 @@
          assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
          assert num_reqs <= self.max_num_reqs
 +        if self._cuda_ok(q, key_cache, value_cache, quant, fp8, q_fp8):
-+            # D=256 (v3 kernel, 2 CTAs/SM): two waves' worth of segments; D=128 (v1): one wave. The
-+            # partial buffers are sized for self.nseg_buf >= this.
-+            nseg = max(1, min(self.nseg_buf, (2 if D == 256 else 1) * _num_sms(q.device) // Hkv))
++            # two CTAs fit on an SM, so two waves' worth of segments for a single request; the partial
++            # buffers are sized for self.nseg_buf >= this.
++            nseg = max(1, min(self.nseg_buf, 2 * _num_sms(q.device) // Hkv))
 +            _sda_ext().run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
 +                           self.part_o, self.part_m, self.part_l, float(scale), int(num_reqs),
 +                           int(max_query_len), self.qmax, nseg, int(window), bool(causal))
