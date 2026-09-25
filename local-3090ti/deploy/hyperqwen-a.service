@@ -4,9 +4,12 @@ After=network.target
 Conflicts=buun-27b-a.service orcabonsai.service qwen38.service
 
 [Service]
+# Pinned KV pool 176 MiB under the profile default (5583457484): still 131,328 tokens (>= 128K) but leaves
+# activation headroom. At the default, two concurrent prefills OOMed the 3090 Ti by 24 MiB (2026-09-25).
+Environment=KV_MEM=5398908108
 Type=simple
 ExecStart=%h/build/HyperQwen/local-3090ti/deploy/run.sh
-Restart=on-failure
+Restart=always
 RestartSec=10
 TimeoutStopSec=60
 
