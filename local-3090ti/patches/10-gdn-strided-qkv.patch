@@ -1,0 +1,105 @@
+--- a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -51,6 +51,9 @@
+     stride_final_state_token: tl.constexpr,
+     stride_indices_seq: tl.constexpr,
+     stride_indices_tok: tl.constexpr,
++    stride_qt,  # qwen27-dev: per-token strides of q/k/v (H*K, H*K, HV*V when contiguous)
++    stride_kt,
++    stride_vt,
+     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
+     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+@@ -80,9 +83,9 @@
+     o_k = i_k * BK + tl.arange(0, BK)
+     o_v = i_v * BV + tl.arange(0, BV)
+ 
+-    p_q = q + (bos * H + i_h) * K + o_k
+-    p_k = k + (bos * H + i_h) * K + o_k
+-    p_v = v + (bos * HV + i_hv) * V + o_v
++    p_q = q + bos * stride_qt + i_h * K + o_k
++    p_k = k + bos * stride_kt + i_h * K + o_k
++    p_v = v + bos * stride_vt + i_hv * V + o_v
+ 
+     p_A_log = A_log + i_hv
+     if not IS_KDA:
+@@ -187,10 +190,10 @@
+             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+         # Update pointers for next timestep
+-        p_q += H * K
+-        p_k += H * K
++        p_q += stride_qt
++        p_k += stride_kt
+         p_o += HV * V
+-        p_v += HV * V
++        p_v += stride_vt
+         p_b += HV
+         p_a += HV
+ 
+@@ -256,6 +259,15 @@
+         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+ 
+     grid = (NK, NV, N * HV)
++    # qwen27-dev: q/k/v may be column views of the conv output (varlen, batch 1): each token's heads are
++    # contiguous, the token stride is not. Anything else gets the old contiguous copies.
++    def _tok_strided(x, h, d):
++        return x.dim() == 4 and x.shape[0] == 1 and x.stride(3) == 1 and x.stride(2) == d
++    if cu_seqlens is not None and _tok_strided(q, H, K) and _tok_strided(k, H, K) and _tok_strided(v, HV, V):
++        stride_qt, stride_kt, stride_vt = q.stride(1), k.stride(1), v.stride(1)
++    else:
++        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
++        stride_qt, stride_kt, stride_vt = H * K, H * K, HV * V
+     fused_sigmoid_gating_delta_rule_update_kernel[grid](
+         A_log=A_log,
+         a=a.contiguous(),
+@@ -263,9 +275,9 @@
+         dt_bias=dt_bias,
+         beta=beta,
+         threshold=threshold,
+-        q=q.contiguous(),
+-        k=k.contiguous(),
+-        v=v.contiguous(),
++        q=q,
++        k=k,
++        v=v,
+         o=o,
+         h0=initial_state,
+         ht=final_state,
+@@ -286,6 +298,9 @@
+         stride_final_state_token=stride_final_state_token,
+         stride_indices_seq=stride_indices_seq,
+         stride_indices_tok=stride_indices_tok,
++        stride_qt=stride_qt,
++        stride_kt=stride_kt,
++        stride_vt=stride_vt,
+         INPLACE_FINAL_STATE=inplace_final_state,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         IS_KDA=is_kda,
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -87,6 +87,7 @@
+ logger = init_logger(__name__)
+ 
+ MAX_FUSED_GDN_MTP_TOKENS = 8
++_QWEN27_STRIDED_QKV = __import__('os').environ.get('VLLM_QWEN27_STRIDED_QKV', '1') == '1'
+ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+ 
+ 
+@@ -1393,7 +1394,15 @@
+         else:
+             mixed_qkv_non_spec = None
+ 
+-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
++        if mixed_qkv_spec is not None and _QWEN27_STRIDED_QKV and mixed_qkv_spec.stride(-1) == 1:
++            # qwen27-dev: the spec path's only consumer (fused_sigmoid_gating_delta_rule_update) takes
++            # per-token strides, so hand it column views instead of 3 reshape copies + a concat
++            _qd, _kd = self.key_dim // self.tp_size, self.key_dim // self.tp_size
++            query_spec = mixed_qkv_spec[:, :_qd].unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0)
++            key_spec = mixed_qkv_spec[:, _qd:_qd + _kd].unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0)
++            value_spec = mixed_qkv_spec[:, _qd + _kd:].unflatten(-1, (-1, self.head_v_dim)).unsqueeze(0)
++        else:
++            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+ 
+         # Split mixed non-spec-decode+prefill to process independently
+         split_non_spec = (

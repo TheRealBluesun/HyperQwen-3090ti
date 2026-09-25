@@ -15,3 +15,5 @@ patch -p1 -N -d "$V" < 07-gdn-shared-metadata-build.patch
 # 09: small-batch silu_and_mul (Triton custom op)
 patch -p1 -N -d "$V" < 09-small-silu-and-mul.patch
 cp 09-qwen27_small_ops.py "$V/model_executor/layers/qwen27_small_ops.py"
+# 10: GDN spec decode reads q/k/v in place
+patch -p1 -N -d "$V" < 10-gdn-strided-qkv.patch
