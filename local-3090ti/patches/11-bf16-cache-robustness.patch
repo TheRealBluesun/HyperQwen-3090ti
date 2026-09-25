@@ -1,0 +1,32 @@
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -315,7 +315,9 @@
+             return out
+         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
+         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
+-        tile = 64  # qwen27-dev: was 32 for block_m > 32 at D=256; 64 fits sm86 smem with 2 stages
++        # qwen27-dev: was 32 for block_m > 32 at D=256; 64 fits sm86 smem with 2 stages for 1-byte caches
++        # (int8 / fp8) -- a bf16 cache needs twice the bytes per tile, so it keeps 32.
++        tile = 64 if (quant or fp8) else 32
+         if envs.VLLM_SPEC_ATTN_DEBUG:
+             self._dbg_calls = getattr(self, "_dbg_calls", 0) + 1
+             if self._dbg_calls in (1, 2, 500, 2000):
+@@ -343,7 +345,7 @@
+             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
+             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
+             WINDOW=window, CAUSAL=causal,
+-            num_warps=8 if D >= 256 else warps, num_stages=2,  # qwen27-dev: was warps (4), 1 stage
++            num_warps=8 if D >= 256 else warps, num_stages=2 if (quant or fp8) else 1,  # qwen27-dev: was warps (4), 1 stage (bf16 keeps 1: smem)
+         )
+         _spec_attn_combine[(num_reqs, Hq, max_query_len)](
+             self.part_o, self.part_m, self.part_l, out, cu_seqlens_q,
+--- a/v1/attention/backends/flash_attn.py
++++ b/v1/attention/backends/flash_attn.py
+@@ -917,6 +917,7 @@
+                 " kv-cache on this device."
+             )
+ 
++        _spec_attn_max_reqs()  # qwen27-dev: prime split-KV buffer sizing while the config is set
+         self.sinks = sinks
+         if self.sinks is not None:
+             assert flash_attn_supports_sinks(), (
