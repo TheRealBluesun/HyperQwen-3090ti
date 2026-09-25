@@ -161,3 +161,13 @@ Prefill unchanged (compute-bound at ~89% of the bf16 tensor peak): 1,297 / 1,146
 Tried and dropped: verify attention v5 (rescale skip, mask-free tiles, FADD int8 decode: +1.5%); a Triton GEMV
 for the bf16 in_proj_ba (2x slower than cuBLAS split-K); strided a/b into the recurrent kernel (they were already
 contiguous there; the real copy is one fused inductor kernel).
+
+### Night of 09-25, v6/v7 verify attention
+| kernel | 110K per layer | 64K | in-server decode 64K / 121K (ms/step) |
+|---|---|---|---|
+| Triton at the start of the night | 1,176 us | 710 | 34.9 / 44.0 |
+| v4 | 536 | 325 | 27.70 / 32.12 |
+| v6 (softmax in registers) | 508 | 306 | 27.40 / - |
+| v7 (two-level int8 Q, s8 MMA Q.K^T) | 355 | 221 | 26.10 / 29.18 |
+v7: 121K decode 94 tok/s (61 at the start of the night); short context unchanged (22.92 ms/step); valid JSON 12/12;
+needles at 100K@10%/90% retrieved. Error vs fp32 reference unchanged (~2.4e-3).
