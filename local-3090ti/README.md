@@ -3,6 +3,7 @@
 Local deployment and optimization work on top of upstream HyperQwen (syv-ai/HyperQwen).
 Requirement: at least 128K context in every configuration.
 
+- ROADMAP.md: current status, how close to the hardware, and the prioritized to-do list.
 - NOTES.md: setup, baseline comparison (vs buun-llama-cpp EXL3), traffic analysis, profile findings, gotchas.
 - PROGRESS.md: every measured configuration, in order.
 - deploy/: run_a.sh (launcher; SPEC=dflash2 CTX=long by default), the systemd user unit, the native
