@@ -45,6 +45,13 @@ Versus the old llama.cpp EXL3 setup: ~1.6–2.3x on typical prompts; 109K ready 
    ~45 tok/s per stream, ~1,000 tok/s aggregate at 64 streams on a 3090).
 
 ## Tried and not worth it
+- Persistent megakernel (one kernel per layer chain, grid barriers, split-K GEMVs): correct end to end for
+  GDN + MLP layers but ~18% slower than the kernel sequence (350 vs 295 us/layer, CUDA-graph timing). In-kernel
+  phase stamps looked at/above the read ceiling; graph timing did not. Dataflow sync (per-chunk counters instead
+  of barriers) didn't help: static per-CTA shares keep slow CTAs slow. `discard.global.L2` is not ordered by
+  release/acquire.
+- Fusing the GDN conv update into the patch-14 kernel: every CTA of a key head recomputes the 256 q/k conv
+  channels (24x redundancy), which costs as much as the separate conv launch saves.
 - Narrow split-K GEMM for the GDN in_proj_ba: ties cuBLAS (5.3 vs 5.4 µs).
 - Fused CUDA GDN decode kernel: needs bf16 recurrent state; only −0.7% (24.32 → 24.14 ms/step).
 - DFLASH_TOKENS=15 at 128K: doesn't fit the KV pool (5.73 GiB needed vs 5.19; bigger pool OOMs).

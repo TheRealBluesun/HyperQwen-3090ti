@@ -25,3 +25,8 @@ patch -p1 -N -d "$V" < 12-prefill-attention-cuda.patch
 #     corrupt output when a verify block is shorter than the previous one: sync scheduling + grammar,
 #     adaptive verify length, DFLASH_TOKENS>7)
 patch -p1 -N -d "$V" < 13-conv1d-spec-varlen-guard.patch
+# 14: lazy GDN state commit for spec decode (opt-in: VLLM_QWEN27_LAZY_GDN=1). New recurrence kernel (JIT-built on
+#     first use) that stores 1 state + a token log per step instead of 8 states; bit-identical states.
+patch -p1 -N -d "$V" < 14-lazy-gdn-state-commit.patch
+cp 14-qwen27_lazy_gdn.py "$V/model_executor/layers/mamba/gdn/qwen27_lazy_gdn.py"
+cp 14-qwen27_gdn_rec.cu "$V/model_executor/layers/mamba/gdn/qwen27_gdn_rec.cu"

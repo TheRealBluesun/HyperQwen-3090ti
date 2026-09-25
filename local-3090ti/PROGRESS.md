@@ -212,3 +212,22 @@ k=7 sync 208.4 (29.16 ms: synchronous scheduling costs 6.3 ms/step); k=11 adapti
 (29.52 x 6.29); k=11 pinned async 262.5 (25.55 x 6.63). So k>7 is now correct but break-even: +11%
 tok/step, and the 12-token verify costs +2.7 ms in the int4 GEMMs. It pays only if M=12 gets as cheap
 as M=8 (the custom W4A16 GEMV item).
+
+## Patch 14: lazy GDN state commit (09-25, both endpoints, `VLLM_QWEN27_LAZY_GDN=1`)
+A spec-decode step of M tokens stores the recurrent state after every token (M x 1.57 MB per GDN layer) so the
+next step can start from whichever one gets accepted. Patch 14 replaces the spec-path recurrence with a CUDA
+kernel (8 lanes per state row, k/q slices in registers, every input loaded in one prologue) that can run *lazy*:
+store only the state the step started from plus a 133 KB log of its tokens (post-conv k, v and raw a, b), and have
+the next step replay its accepted tokens from there. The replay rounds through fp16 exactly where the full path
+stores/reloads, so every state is bit-identical to what the full step would have written.
+- Everything else still sees the full layout: align-mode prefix-cache copies only fire at block boundaries, so
+  steps within 32/24 tokens of one run full; a request whose last step was lazy and that is read by anything
+  else first (e.g. a zero-draft step) is "materialized" (lazy step replayed, per-token states stored).
+- Hooks live in the V2 model runner (`model_states/mamba_hybrid.py`: slot reset, per-step decision, capture);
+  per-row modes reach the layers through persistent buffers filled by the GDN metadata builder (graph safe).
+- Validation: 8 long greedy requests token-identical across lazy / full / full-every-3rd-step /
+  materialize-every-2nd-step; oracle scoring clean (max gap 0.12-0.13, as before) incl. 4 concurrent requests;
+  ~91% of decode rows run lazy in production.
+- Speed: in-server recurrence 21.2 us (Triton) / 18.9 us (new kernel, full) / 15.8 us (lazy) per GDN layer:
+  about +0.8-1% decode tok/s. Smaller than the isolated benchmark suggested (the state writes overlap other work in
+  the live pipeline; the lazy kernel is latency-bound: prologue loads + the serial token chain).
