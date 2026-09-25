@@ -12,3 +12,6 @@ patch -p1 -N -d "$V" < 06-cuda-verify-attention.patch
 cp 06-qwen27_sda.cu "$V/v1/attention/ops/qwen27_sda.cu"
 # 07: GDN attention metadata built once per step (shared across the 6 GDN kv-cache groups)
 patch -p1 -N -d "$V" < 07-gdn-shared-metadata-build.patch
+# 09: small-batch silu_and_mul (Triton custom op)
+patch -p1 -N -d "$V" < 09-small-silu-and-mul.patch
+cp 09-qwen27_small_ops.py "$V/model_executor/layers/qwen27_small_ops.py"

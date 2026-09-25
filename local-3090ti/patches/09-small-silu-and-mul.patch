@@ -1,0 +1,26 @@
+--- a/model_executor/layers/activation.py
++++ b/model_executor/layers/activation.py
+@@ -107,6 +107,12 @@
+         return out
+ 
+ 
++import os as _os
++
++_QWEN27_SMALL_SILU = _os.environ.get("VLLM_QWEN27_SMALL_SILU", "1") == "1"
++if _QWEN27_SMALL_SILU:
++    import vllm.model_executor.layers.qwen27_small_ops  # noqa: F401  (registers the op)
++
+ # --8<-- [start:silu_and_mul]
+ @CustomOp.register("silu_and_mul")
+ class SiluAndMul(CustomOp):
+@@ -140,6 +146,10 @@
+         d = x.shape[-1] // 2
+         output_shape = x.shape[:-1] + (d,)
+         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
++        if _QWEN27_SMALL_SILU and current_platform.is_cuda() and x.dim() == 2:
++            # qwen27-dev: small-batch launch shape (see qwen27_small_ops)
++            torch.ops.vllm.qwen27_silu_and_mul(out, x)
++            return out
+         self.op(out, x)
+         return out
+ 
