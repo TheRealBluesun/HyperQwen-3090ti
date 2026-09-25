@@ -61,3 +61,13 @@ The cap exists because both cards share an 850 W PSU: owner decision (e.g. GPU0 
 :8002 was buun-llama-cpp EXL3 (disabled, kept for rollback); now the same HyperQwen DFlash2 128K setup,
 same venv and patches (`deploy/run.sh` with GPU/PORT from the unit). The 3090's step is ~8% longer,
 matching its ~7% lower memory bandwidth (936 vs 1,008 GB/s).
+
+### Re-profile of :8002 at 350 W (09-24 late, prof/p2-b-350W; RTX 3090, 936 GB/s)
+Short-context decode (24.97 ms/step under nsys, 23.8 without; ~15.2 GB moved per step):
+int4 GEMMs 19.66 ms (78.7%, ~737 GB/s = 79% of peak) · GDN recurrence+conv 1.13 · bf16 GEMMs 1.07 ·
+norms/activations 0.69 · glue 0.54 · attention 0.50 · drafter/sampling 0.15 · other 0.11 · idle 1.13.
+Whole step ≈ 638 GB/s = **68% of peak**. Floor at a realistic 92%: ~17.7 ms (1.35x headroom): GEMM
+efficiency ~2.8 ms, small kernels ~4.2 ms, idle ~1.1 ms.
+Deep context: decode @109K 42.2 ms/step = verify attention 17.9 (reads ~3.6 GB int8 KV per step → ~21% of
+bandwidth; compute floor ~5–6 ms) + GEMMs 19.1 + other 4.8 + idle 0.3. 109K prefill 166 s = attention 87 s
+(~27 TFLOP/s, ~38% of the 3090's ~71 TFLOP/s bf16 tensor peak) + GEMMs 74 s (~72 TFLOP/s: at peak).
