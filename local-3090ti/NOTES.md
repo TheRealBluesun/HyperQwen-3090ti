@@ -1,14 +1,14 @@
 # Qwen3.8-27B on a home inference server, :8001 — baseline notes (2026-09-24)
 
 Hardware: GPU0 RTX 3090 Ti (24 GB, power-capped to 300 W on purpose: both cards share an 850 W PSU),
-i9-9900K, 31 GB RAM. :8002 (GPU1, RTX 3090) serves the same model for another workload and is left untouched.
+i9-9900K, 31 GB RAM. :8002 (GPU1, RTX 3090) serves the same model for another workload (since migrated to the same setup).
 Requirement from the user: at least 128K context in every configuration.
 
 ## Baseline chosen: HyperQwen single-user, CTX=long (150K), SPEC=mtp
 - Repo: ~/build/HyperQwen (github.com/syv-ai/HyperQwen @ 1cf8665), native venv via uv (host lacks
   python3-venv), vLLM 0.29.0 + the repo's patch stack, model dbirks/Qwen3.8-27B-W4A16-AutoRound
   (+ repo requant: int8 lm_head/embeddings, MTP, 40K draft vocab, int4-GPTQ "fast" variant, DFlash2 drafter).
-- Service (since 09-24 evening: SPEC=dflash2 CTX=long, 128K): systemd user unit `hyperqwen-a.service` -> ~/build/HyperQwen/run_a.sh (GPU0, port 8001,
+- Services (since 09-24 evening: SPEC=dflash2 CTX=long, 128K, both GPUs at 350 W): systemd user units `hyperqwen-a.service` (GPU0, :8001) and `hyperqwen-b.service` (GPU1, :8002) -> local-3090ti/deploy/run.sh (
   streamed weight loading, names `Qwen3.8-27B` + `qwen3.8-27b`, thinking off by default).
   `buun-27b-a` (old llama.cpp fork setup) is disabled but installed. Rollback:
   `systemctl --user disable --now hyperqwen-a && systemctl --user enable --now buun-27b-a`.

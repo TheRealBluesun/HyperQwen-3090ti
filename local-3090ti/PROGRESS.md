@@ -52,3 +52,12 @@ int4 GEMV that reads Marlin's layout: ~0.5–1 ms/step (2–4%), mostly on the s
 | 400 W | 21.95 | +10.8% | 1,266 | 1,927 MHz | 398 W |
 Knee at 325–350 W; above that decode is bandwidth-bound again. GPU1 (:8002) idle (~27 W) during the test.
 The cap exists because both cards share an 850 W PSU: owner decision (e.g. GPU0 350 / GPU1 250 keeps 600 W total).
+
+### Both GPUs at 350 W (persistent since 09-24: /etc/default/nvidia-power-limit LIMIT_W=350) and :8002 migrated
+| Endpoint | GPU | ms/step | greedy code / prose / explain / json | prefill 18K | 109K prefill | decode @109K |
+|---|---|---|---|---|---|---|
+| :8001 hyperqwen-a | 3090 Ti, 350 W | **22.00** | 252 / 131 / 182 / 290 | 1,237 | (not re-run) | — |
+| :8002 hyperqwen-b | 3090, 350 W | **23.83** | 230 / 114 / 174 / 268 | 1,148 | 168 s | 65 |
+:8002 was buun-llama-cpp EXL3 (disabled, kept for rollback); now the same HyperQwen DFlash2 128K setup,
+same venv and patches (`deploy/run.sh` with GPU/PORT from the unit). The 3090's step is ~8% longer,
+matching its ~7% lower memory bandwidth (936 vs 1,008 GB/s).

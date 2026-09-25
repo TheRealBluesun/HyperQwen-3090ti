@@ -1,10 +1,12 @@
 [Unit]
-Description=HyperQwen (patched vLLM 0.29) Qwen3.8-27B W4A16 instance A (GPU0, 128k ctx, DFlash2, port 8001)
+Description=HyperQwen (patched vLLM 0.29) Qwen3.8-27B W4A16 instance B (GPU1, 128k ctx, DFlash2, port 8002)
 After=network.target
-Conflicts=buun-27b-a.service orcabonsai.service qwen38.service
+Conflicts=buun-27b-b.service
 
 [Service]
 Type=simple
+Environment=GPU=1
+Environment=PORT=8002
 ExecStart=%h/build/HyperQwen/local-3090ti/deploy/run.sh
 Restart=on-failure
 RestartSec=10
