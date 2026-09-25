@@ -139,3 +139,25 @@ Measured and rejected tonight (details in NOTES.md):
   GEMMs too; weights are repacked for it) and greedy outputs diverge from W4A16 early (upstream: ppl +4.1%).
   Net ~-6% per memory-service request; left off, the user's call.
 - DFLASH_TOKENS>7 at CTX=long: corrupt output (not caused by our patches; the GDN state-slot count is right).
+
+### Night of 09-25, late: small-kernel and GEMM-config work (dev, :8002, RTX 3090 @ 350 W)
+| Change | retain greedy ms/step (tok/s) | chat ms/step | Notes |
+|---|---|---|---|
+| after #07 | 24.13 (250.7) | 23.73 | |
+| #08 Marlin M<=8 table: CTA count + tile config per shape | 23.54 (259.4) | 23.16 | standalone vLLM-0.29 Marlin, `VLLM_MARLIN_TUNE=1`; <= 1 bf16 ulp vs stock |
+| #09 small-batch silu_and_mul (Triton) | 23.34 (261.5) | 22.94 | 4.9 -> 1.8 us, bit-identical |
+| #10 GDN spec decode reads q/k/v in place | 23.06 (264.6) | 22.69 | -4 kernels/layer, bit-identical |
+
+Full dev stack vs the start of the night (single session, uncached prompt, ~400-token summary):
+| ctx | ms/step before -> now | decode tok/s before -> now |
+|---|---|---|
+| 1K | 24.2 -> 22.7 | 157 -> 172 |
+| 18K | 27.3 -> 24.1 | 103 -> 117 |
+| 34K | 30.0 -> 25.4 | 94 -> 103 |
+| 63K | 34.9 -> 27.7 | 78 -> 96 |
+| 121K | 44.0 -> 32.1 | 61 -> 84 |
+Prefill unchanged (compute-bound at ~89% of the bf16 tensor peak): 1,297 / 1,146 / 1,008 / 824 / 609 tok/s.
+
+Tried and dropped: verify attention v5 (rescale skip, mask-free tiles, FADD int8 decode: +1.5%); a Triton GEMV
+for the bf16 in_proj_ba (2x slower than cuBLAS split-K); strided a/b into the recurrent kernel (they were already
+contiguous there; the real copy is one fused inductor kernel).

@@ -55,8 +55,9 @@ Versus the old llama.cpp EXL3 setup: ~1.6–2.3x on typical prompts; 109K ready 
 
 ## Update after the night of 09-25 (dev tree on :8002; see PROGRESS.md)
 Done: verify attention in CUDA (#06: 2.2x at 110K, drafter 2.3x), V2 sampler small-k (#03), split-KV drafter +
-buffer sizing (#04, 1.9 GB freed), GDN metadata once per step (#07). Retain decode 24.87 -> 24.13 ms/step;
-121K decode 61 -> 82 tok/s. Not yet on :8001 (the deployed venv has #01-#04 only).
+buffer sizing (#04, 1.9 GB freed), GDN metadata once per step (#07), Marlin M<=8 config table (#08), small-batch
+silu_and_mul (#09), GDN q/k/v in place (#10). Retain decode 24.87 -> 23.06 ms/step; 121K decode 61 -> 84 tok/s.
+Not yet on :8001 (the deployed venv has #01-#04 only).
 Remaining, by expected value:
 1. Verify attention v5: the kernel is now CUDA-core bound (int8->fp conversions, masking, softmax, rescale:
    ~14x the tensor instructions). Skip the rescale when no row max changed, a no-mask fast path for interior
