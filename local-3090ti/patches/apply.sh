@@ -7,3 +7,6 @@ V=${VLLM_DIR:-../../venv/lib/python3.12/site-packages/vllm}
 for p in 01-spec-attn-tuning.patch 02-unified-attn-sm86-prefill.patch 03-v2-sampler-small-topk.patch 04-split-kv-drafter-and-buffer-sizing.patch; do
   patch -p1 -N -d "$V" < "$p"
 done
+# 06: CUDA split-KV verify attention (sm86). The kernel source is JIT-built on first use.
+patch -p1 -N -d "$V" < 06-cuda-verify-attention.patch
+cp 06-qwen27_sda.cu "$V/v1/attention/ops/qwen27_sda.cu"

@@ -1,0 +1,95 @@
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -41,6 +41,8 @@
+ window / softcap / alibi.
+ """
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -202,6 +204,37 @@
+         tl.store(out_ptr + (q_start + i) * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
+ 
+ 
++_SDA_EXT = False
++
++
++def _sda_ext():
++    """qwen27-dev: JIT-build (once, cached under ~/.cache/torch_extensions) and load the CUDA
++    split-KV partial + combine kernels. None if the build fails -> Triton path."""
++    global _SDA_EXT
++    if _SDA_EXT is False:
++        try:
++            from torch.utils.cpp_extension import load
++
++            src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen27_sda.cu")
++            _SDA_EXT = load(name="qwen27_sda", sources=[src],
++                            extra_cuda_cflags=["-O3", "-gencode=arch=compute_86,code=sm_86"])
++        except Exception as e:  # noqa: BLE001
++            import logging
++
++            logging.getLogger(__name__).warning("qwen27_sda CUDA kernel unavailable (%s); using Triton", e)
++            _SDA_EXT = None
++    return _SDA_EXT
++
++
++_NUM_SMS = {}
++
++
++def _num_sms(device):
++    if device not in _NUM_SMS:
++        _NUM_SMS[device] = torch.cuda.get_device_properties(device).multi_processor_count
++    return _NUM_SMS[device]
++
++
+ class SpecDecodeAttention:
+     """Holds the partial buffers; call .run(...) per layer."""
+ 
+@@ -216,7 +249,9 @@
+         self.num_heads = num_heads
+         self.head_dim = head_dim
+         self.device = device
+-        n = max_num_reqs * num_heads * qmax * self.nseg
++        # qwen27-dev: the CUDA path may use up to 48 segments (non-power-of-two); Triton keeps self.nseg
++        self.nseg_buf = max(self.nseg, 48)
++        n = max_num_reqs * num_heads * qmax * self.nseg_buf
+         self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
+         self.part_m = torch.empty(n, dtype=torch.float32, device=device)
+         self.part_l = torch.empty(n, dtype=torch.float32, device=device)
+@@ -239,6 +274,19 @@
+         qt = max(1, block_m // G)
+         return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
+ 
++    def _cuda_ok(self, q, key_cache, value_cache, quant, fp8, q_fp8):
++        """qwen27-dev: the sm86 CUDA partial kernel (qwen27_sda.cu) handles the int8 per-token-head
++        cache with inline scales; everything else stays on the Triton path."""
++        if not quant or fp8 or q_fp8 or q.dtype != torch.bfloat16 or os.environ.get("VLLM_SPEC_ATTN_CUDA", "1") == "0":
++            return False
++        D = q.shape[2]
++        return (D in (128, 256) and key_cache.stride(3) == 1 and value_cache.stride(3) == 1
++                and key_cache.stride(2) % 4 == 0 and value_cache.stride(2) % 4 == 0
++                and key_cache.shape[1] % 32 == 0 and key_cache.stride(1) % 16 == 0 and key_cache.stride(0) % 16 == 0
++                and value_cache.stride(1) % 16 == 0 and value_cache.stride(0) % 16 == 0
++                and key_cache.data_ptr() % 4 == 0 and value_cache.data_ptr() % 4 == 0
++                and q.stride(2) == 1 and q.stride(1) % 8 == 0 and q.stride(0) % 8 == 0 and _sda_ext() is not None)
++
+     def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale,
+             num_reqs, max_query_len, k_scale_cache=None, v_scale_cache=None,
+             k_descale=None, v_descale=None, q_descale=None, window=0, causal=True):
+@@ -257,6 +305,14 @@
+             assert q_descale is not None, "fp8 query needs its descale"
+         assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
+         assert num_reqs <= self.max_num_reqs
++        if self._cuda_ok(q, key_cache, value_cache, quant, fp8, q_fp8):
++            # D=256 (v3 kernel, 2 CTAs/SM): two waves' worth of segments; D=128 (v1): one wave. The
++            # partial buffers are sized for self.nseg_buf >= this.
++            nseg = max(1, min(self.nseg_buf, (2 if D == 256 else 1) * _num_sms(q.device) // Hkv))
++            _sda_ext().run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
++                           self.part_o, self.part_m, self.part_l, float(scale), int(num_reqs),
++                           int(max_query_len), self.qmax, nseg, int(window), bool(causal))
++            return out
+         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
+         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
+         tile = 64  # qwen27-dev: was 32 for block_m > 32 at D=256; 64 fits sm86 smem with 2 stages
