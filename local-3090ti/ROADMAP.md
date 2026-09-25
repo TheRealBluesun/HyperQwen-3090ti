@@ -64,5 +64,5 @@ Remaining, by expected value:
    tiles, int8->bf16 via PRMT+FADD instead of I2F. Est. 538 -> ~420 us/layer at 110K (~+5% decode at 121K).
 2. A W4A16 GEMV for M<=16 that reads Marlin's packed layout but gives each CTA whole column tiles (no cross-CTA
    split-K, K split across warps in the CTA): the only route to the ~2 ms/step Marlin gap (~8% at short context).
-3. DFLASH_TOKENS>7 correctness on CTX=long (the lookup tail is worth up to ~+10% tok/step on copy-heavy JSON).
+3. (done: #13, conv1d guard; k>7 correct but break-even at 262.5 vs 262.6 tok/s until M=12 GEMMs are as cheap as M=8) DFLASH_TOKENS>7 correctness.
 4. (done: #12, 121K prefill 199 -> 139 s) Prefill is now GEMM-bound at the bf16 tensor peak; INT8_ACT is the lever.

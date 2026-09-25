@@ -183,3 +183,32 @@ unified_attention for all non-verify attention on the int8 cache: 64-67 TFLOP/s 
 | 121K | 199 -> 139 s | 609 -> 873 |
 Checks: replay valid JSON 12/12, needles 30K@50% + 100K@10/50/90% retrieved, GSM8K 200 95.5% (96.0% before).
 Prefill is now GEMM-bound (Marlin at the bf16 tensor peak); the remaining lever there is INT8_ACT (quality trade).
+
+## Patch 13: verify-length bug fixed (09-25)
+Symptom: DFLASH_TOKENS>7 produced corrupt greedy output in JSON mode ("restarts every 15 seconds" ->
+"restarts every 1/its user session"). Not specific to k>7: k=7 with synchronous scheduling breaks the same way,
+on the original venv too (pre-existing, not from patches 06-12), in eager mode too.
+Root cause: `_causal_conv1d_update_kernel` (GDN conv, spec-decode path) rejects `num_accepted > seqlen`,
+zeroing the conv output and skipping the state update. `num_accepted` is from the PREVIOUS step, so any
+verify block shorter than the previous step's accepted count trips it in every GDN layer. Block lengths
+vary when synchronous scheduling trims drafts at the first grammar-invalid token, under the adaptive
+lookup length, and near max_model_len. Async scheduling at k=7 (production) pads rejected drafts
+with -1, so the length stays constant and production was not affected.
+Fix: bound the check by the conv-state capacity (columns - (width - 1) + 1). The rest of the rolling-state
+arithmetic is independent of the previous length. Likely also the root cause of upstream's
+"adaptive length corrupts a prefix-cache hit under KVarN" note (length 16 -> 8 after >8 accepted).
+Verification: greedy outputs teacher-forced through a non-speculative bf16 oracle (prompt_logprobs);
+count tokens that are not the oracle's argmax by >1 nat (`lossless.py`):
+| config (8 req x 600 tok, JSON mode) | before | after |
+|---|---|---|
+| k=7, sync scheduling | 24 bad (max 27 nats) | 1* |
+| k=11 pinned, sync | 264 bad | 1* |
+| k=11 adaptive, sync | - | 1* (0 without JSON mode) |
+| k=11 pinned, async | - | 1* |
+| k=7 async (production) | 0 without JSON mode | unchanged |
+*the grammar forcing `{` where the model wants a code fence (identical in every JSON run).
+Speed on the memory-service replay (greedy, 12 req): k=7 async 262.6 tok/s (22.87 ms x 5.95);
+k=7 sync 208.4 (29.16 ms: synchronous scheduling costs 6.3 ms/step); k=11 adaptive (sync) 215.5
+(29.52 x 6.29); k=11 pinned async 262.5 (25.55 x 6.63). So k>7 is now correct but break-even: +11%
+tok/step, and the 12-token verify costs +2.7 ms in the int4 GEMMs. It pays only if M=12 gets as cheap
+as M=8 (the custom W4A16 GEMV item).

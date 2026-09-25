@@ -21,3 +21,7 @@ patch -p1 -N -d "$V" < 10-gdn-strided-qkv.patch
 patch -p1 -N -d "$V" < 11-bf16-cache-robustness.patch
 # 12: prefill attention through the CUDA kernel (direct mode)
 patch -p1 -N -d "$V" < 12-prefill-attention-cuda.patch
+# 13: conv1d spec-decode guard bounded by conv-state capacity, not this step's length (fixes
+#     corrupt output when a verify block is shorter than the previous one: sync scheduling + grammar,
+#     adaptive verify length, DFLASH_TOKENS>7)
+patch -p1 -N -d "$V" < 13-conv1d-spec-varlen-guard.patch
