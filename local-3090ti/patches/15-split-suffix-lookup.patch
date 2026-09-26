@@ -1,0 +1,171 @@
+--- a/v1/worker/gpu/spec_decode/dflash2/lookup.py
++++ b/v1/worker/gpu/spec_decode/dflash2/lookup.py
+@@ -26,6 +26,8 @@
+ with an NMIN-token reject test before any candidate is extended.
+ """
+ 
++import os
++
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
+@@ -106,6 +108,102 @@
+     tl.store(out_valid_ptr + req, valid)
+ 
+ 
++# qwen27: the scan split over NSPLIT programs per request (the single-program scan took ~265 us at 100K of
++# history). Each program takes every NSPLIT-th BLOCK of candidate ends and folds its best packed score into
++# best[req] with an atomic max; max is order-independent, so the result is exactly the single-program one.
++_LOOKUP_SPLIT = int(os.environ.get("VLLM_QWEN27_LOOKUP_SPLIT", "64"))
++
++
++@triton.jit
++def _suffix_scan_kernel(
++    all_token_ids_ptr,
++    all_token_ids_stride,
++    total_len_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    best_ptr,
++    search_max,
++    NMAX: tl.constexpr,
++    NMIN: tl.constexpr,
++    BLOCK: tl.constexpr,
++    NSPLIT: tl.constexpr,
++):
++    req = tl.program_id(0)
++    part = tl.program_id(1)
++    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
++    if req_state < 0:
++        return
++    total_len = tl.load(total_len_ptr + req_state)
++    if total_len < NMIN + 2:
++        return
++    base = all_token_ids_ptr + req_state.to(tl.int64) * all_token_ids_stride
++    end_of_suffix = total_len - 1
++    hi = end_of_suffix
++    lo = tl.maximum(NMIN - 1, total_len - search_max)
++    best = tl.full([], -1, tl.int64)
++    for start in range(lo + part * BLOCK, hi, NSPLIT * BLOCK):
++        e = start + tl.arange(0, BLOCK)
++        alive = (e < hi) & (e >= lo)
++        for j in range(NMIN):
++            s_j = tl.load(base + end_of_suffix - j)
++            t_j = tl.load(base + e - j, mask=alive & ((e - j) >= 0), other=-1)
++            alive = alive & (t_j == s_j)
++        if tl.max(alive.to(tl.int32)) > 0:
++            match = tl.where(alive, NMIN, 0)
++            longer = alive
++            for j in range(NMIN, NMAX):
++                s_j = tl.load(
++                    base + end_of_suffix - j, mask=(end_of_suffix - j) >= 0, other=-2
++                )
++                t_j = tl.load(base + e - j, mask=longer & ((e - j) >= 0), other=-1)
++                longer = longer & (t_j == s_j)
++                match = tl.where(longer, match + 1, match)
++            score = tl.where(alive, match.to(tl.int64) * SCORE_STRIDE + e.to(tl.int64), -1)
++            best = tl.maximum(best, tl.max(score, axis=0))
++    if best >= 0:
++        tl.atomic_max(best_ptr + req, best)
++
++
++@triton.jit
++def _suffix_extract_kernel(
++    all_token_ids_ptr,
++    all_token_ids_stride,
++    total_len_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    best_ptr,
++    out_tokens_ptr,
++    out_tokens_stride,
++    out_len_ptr,
++    out_valid_ptr,
++    k: tl.constexpr,
++    NMIN: tl.constexpr,
++    BLOCK_KT: tl.constexpr,
++):
++    req = tl.program_id(0)
++    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
++    if req_state < 0:
++        return
++    tl.store(out_len_ptr + req, 0)
++    tl.store(out_valid_ptr + req, 0)
++    total_len = tl.load(total_len_ptr + req_state)
++    if total_len < NMIN + 2:
++        return
++    best = tl.load(best_ptr + req)
++    if best < 0:
++        return
++    base = all_token_ids_ptr + req_state.to(tl.int64) * all_token_ids_stride
++    end_of_suffix = total_len - 1
++    match_len = (best // SCORE_STRIDE).to(tl.int32)
++    end = (best % SCORE_STRIDE).to(tl.int32)
++    valid = tl.minimum(k, end_of_suffix - end)
++    idx = tl.arange(0, BLOCK_KT)
++    toks = tl.load(base + end + 1 + idx, mask=idx < valid, other=0)
++    tl.store(out_tokens_ptr + req * out_tokens_stride + idx, toks, mask=idx < k)
++    tl.store(out_len_ptr + req, match_len)
++    tl.store(out_valid_ptr + req, valid)
++
++
+ @triton.jit
+ def _fuse_draft_kernel(
+     draft_tokens_ptr,
+@@ -246,6 +344,7 @@
+     out_tokens: torch.Tensor | None = None,
+     out_len: torch.Tensor | None = None,
+     out_valid: torch.Tensor | None = None,
++    best: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Returns (tokens [num_reqs, k] int32, match_len [num_reqs] int32; 0 = no match,
+     valid [num_reqs] int32 = how many of the k tokens the match actually supplied).
+@@ -259,6 +358,21 @@
+         out_len = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+     if out_valid is None:
+         out_valid = torch.zeros(num_reqs, dtype=torch.int32, device=device)
++    if _LOOKUP_SPLIT > 1 and best is not None:
++        # best: caller-owned int64 [>= num_reqs] scratch, allocated with the caller's other buffers (never here:
++        # the first call can happen inside CUDA-graph capture)
++        best = best[:num_reqs]
++        best.fill_(-1)
++        _suffix_scan_kernel[(num_reqs, _LOOKUP_SPLIT)](
++            all_token_ids, all_token_ids.stride(0), total_len, idx_mapping, idx_mapping_stride, best, search_max,
++            NMAX=nmax, NMIN=nmin, BLOCK=1024, NSPLIT=_LOOKUP_SPLIT, num_warps=4,
++        )
++        _suffix_extract_kernel[(num_reqs,)](
++            all_token_ids, all_token_ids.stride(0), total_len, idx_mapping, idx_mapping_stride, best,
++            out_tokens, out_tokens.stride(0), out_len, out_valid,
++            k=k, NMIN=nmin, BLOCK_KT=triton.next_power_of_2(k), num_warps=1,
++        )
++        return out_tokens, out_len, out_valid
+     _suffix_lookup_kernel[(num_reqs,)](
+         all_token_ids,
+         all_token_ids.stride(0),
+--- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -215,6 +215,8 @@
+         )
+         self._lookup_len = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=device)
+         self._lookup_valid = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=device)
++        # qwen27: scratch for the split suffix scan (per-request best packed score)
++        self._lookup_best = torch.full((self.max_num_reqs,), -1, dtype=torch.int64, device=device)
+         # Which draft positions came from the lookup, per request: what the point-mass
+         # rewrite of the draft distribution applies to.
+         self._lookup_use = torch.zeros(
+@@ -582,6 +584,7 @@
+             out_tokens=self._lookup_tokens[:num_reqs],
+             out_len=self._lookup_len[:num_reqs],
+             out_valid=self._lookup_valid[:num_reqs],
++            best=self._lookup_best[:num_reqs],
+         )
+         # Every position is supplied by the lookup, so the draft distribution
+         # is a point mass everywhere (rejection sampling stays exact).
+@@ -741,6 +744,7 @@
+             out_tokens=self._lookup_tokens[:num_reqs],
+             out_len=self._lookup_len[:num_reqs],
+             out_valid=self._lookup_valid[:num_reqs],
++            best=self._lookup_best[:num_reqs],
+         )
+         fuse_draft(
+             self.draft_tokens[:num_reqs],

@@ -231,3 +231,24 @@ stores/reloads, so every state is bit-identical to what the full step would have
 - Speed: in-server recurrence 21.2 us (Triton) / 18.9 us (new kernel, full) / 15.8 us (lazy) per GDN layer:
   about +0.8-1% decode tok/s. Smaller than the isolated benchmark suggested (the state writes overlap other work in
   the live pipeline; the lazy kernel is latency-bound: prologue loads + the serial token chain).
+
+## Patch 15 + what didn't work (09-26)
+Production profile at ~100K context, 28.7 ms/step: int4 GEMMs 19.3 ms (92% of the weight-read floor), target
+verify attention 16 x 342 us = 5.5 ms, drafter attention already windowed (5 x 18 us), and the DFlash2 lookup's
+suffix scan -- a single Triton program walking the whole history -- 265 us/step.
+- Patch 15: the scan split over 64 programs per request, folded with an int64 atomic max on the same packed
+  (match length, position) score, so the proposal is exactly the old one (40 randomized trials). 124 -> 6 us at
+  105K in isolation. Scratch buffer is allocated by the speculator with its other lookup buffers (a lazily
+  allocated one can land in a CUDA-graph memory pool). Oracle scoring clean (max gap 0.12). ~1% at 100K.
+- Not worth it:
+  - A single-kernel GEMV for the GDN in_proj_ba: slower than cuBLAS + split-K reduce at M >= 8 (every CTA
+    re-reads the activations from L2).
+  - Drafter-side int4 (its fused K/V projection through Marlin, RTN int4 conv projection): no measurable
+    ms/step change at 64K / 100K.
+  - Verify attention past v7 (358 us vs a 257 us read floor at 105K): lazy softmax rescale, fp16-accumulated
+    P.V, a deeper cp.async ring at one CTA per SM (+55%), and a warp-specialized kernel (Q.K^T/softmax warps
+    handing P to P.V warps through named barriers; 20-25% slower). Skipping either phase in the specialized
+    kernel gives ~285 us, both together ~the sum: the phases contend for the same SM resources rather than
+    waiting on each other, which is also why overlap tricks don't help v7.
+- Trap: `spec_decode_attn._sda_ext()` swallows a failed JIT build and returns None, and the wrapper then runs the
+  Triton kernel. Check the kernel name when benchmarking a modified `qwen27_sda.cu`.

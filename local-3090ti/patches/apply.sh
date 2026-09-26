@@ -30,3 +30,6 @@ patch -p1 -N -d "$V" < 13-conv1d-spec-varlen-guard.patch
 patch -p1 -N -d "$V" < 14-lazy-gdn-state-commit.patch
 cp 14-qwen27_lazy_gdn.py "$V/model_executor/layers/mamba/gdn/qwen27_lazy_gdn.py"
 cp 14-qwen27_gdn_rec.cu "$V/model_executor/layers/mamba/gdn/qwen27_gdn_rec.cu"
+# 15: DFlash2 lookup drafting: the context suffix scan split over 64 programs per request (was one program
+#     scanning the whole history: ~265 us/step at 100K of context). Same result exactly (max-reduction).
+patch -p1 -N -d "$V" < 15-split-suffix-lookup.patch
