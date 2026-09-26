@@ -304,3 +304,15 @@ tokens per step on sampled text: not a win on this card.
   divides it) if you run k=15.
 - Patch 18: lazy GDN disables itself when the verify block exceeds 8 tokens; before it, k=15 with lazy GDN on
   accepted only the first draft.
+
+## Small-kernel fusion pass: nothing measurable left
+Profile at 32K context (k=7): 23.65 ms/step of kernels in 1,126 launches; outside Marlin, 4.65 ms in 693.
+- Drafter context K/V projection through Marlin on the checkpoint's own int4 values (instead of a 105 MB
+  dequantized bf16 copy): -0.13 ms/step, invisible in end-to-end tok/s. Adding round-to-nearest int4 for the
+  drafter's conv kernel_projection saves another ~0.2 ms but costs ~1% acceptance: a wash. Neither shipped.
+- GDN output zero-fills stay (padded CUDA-graph rows must be zero); the in_proj_ba GEMM has resisted three
+  replacements.
+- What remains is a per-kernel launch/ramp tax (~2.5-3 us x ~700 kernels) that only a persistent kernel removes,
+  and the persistent-kernel prototype measured slower. With the weight GEMMs at ~92% of the read floor, verify
+  attention near its limit and wider verification not paying (above), single-card decode is at its practical
+  ceiling for lossless changes.
