@@ -271,3 +271,22 @@ block short, even for block-aligned prompts.
   eighth diverges at a near-tie), oracle scoring clean for both (max gap 0.12).
 - Remaining: the partial tail (~300 tokens per turn) needs `--prefix-match-unit`, which vLLM disables here because
   the drafter's sliding-window group has no fine-grained lookup.
+
+## Fine-grained prefix hits with the DFlash drafter (patch 17)
+- Every agent turn's prompt diverges from the previous one exactly one token before its end (the chat template drops
+  the previous turn's thinking, so the `<think>\n` token re-tokenizes). Block-granular hits therefore re-prefilled
+  (L-1) mod 864 already-seen tokens per turn: 394 on average over 237 turn pairs.
+- vLLM already implements hybrid fine-grained hits (`--prefix-match-unit` below the block size: the prompt's last
+  hash boundary is registered as a partial tail, the Mamba align state is privatised by copy-on-write), but turns
+  them off when any KV group lacks fine-grained lookup -- here the drafter's sliding-window group. Patch 17 adds it:
+  probe the partial tail, require the full blocks the window still attends, register the prompt's partial tail
+  block; copy-on-write of the shared tail comes from the base manager. `run.sh` passes `--prefix-match-unit 32`
+  (`PREFIX_MATCH_UNIT=864` restores block-granular hits).
+- Correctness: hit lengths land on the expected 32-token boundary (e.g. 61,792 vs 61,344 block-aligned). Over 36
+  partial hits the first-token distribution is bit-identical to a cold run whenever the cold run also ends a chunk
+  at the hit point; otherwise the top-token logprob differs by 4e-5..4e-3, the effect of one extra fp16 checkpoint
+  of the GDN state (production already checkpoints at every 864-token boundary). Draft acceptance on the hit path
+  equals the cold run's.
+- Agent benchmark (10 tasks x 2, default reasoning effort), per turn: already-seen re-prefill 394 -> 26 tokens
+  (median 14); total 93.5K -> 5.6K tokens (-94%); follow-up TTFT median 1.21 -> 1.05 s (-13%), 32-48K prompts
+  1.71 -> 1.56 s. Prompts under 16K pay ~0.05 s for the extra short prefill chunk.

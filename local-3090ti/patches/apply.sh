@@ -37,3 +37,7 @@ patch -p1 -N -d "$V" < 15-split-suffix-lookup.patch
 #     back-off that matches it, re-prefilled 864 already-seen tokens on every agent turn).
 #     VLLM_QWEN27_DFLASH_KEEP_LAST_BLOCK=0 restores the old behaviour.
 patch -p1 -N -d "$V" < 16-dflash-keep-last-cached-block.patch
+# 17: fine-grained (sub-block) prefix-cache hits for the sliding-window KV group (DFlash drafter). vLLM disabled
+#     hybrid fine-grained hits for any model with a sliding-window group; with this and --prefix-match-unit 32 an
+#     agent turn resumes within 32 tokens of the previous prompt instead of up to 863 tokens before it.
+patch -p1 -N -d "$V" < 17-swa-fine-grained-prefix-hits.patch
