@@ -699,7 +699,9 @@ fi
 # at the largest image it will accept, and that peak comes out of the KV pool:
 # 2097152 px = 2048 image tokens.
 if [ "${VISION:-0}" = 1 ]; then
-  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+  # MAX_IMAGES (env, default 1): images per prompt. Encoder forwards run sequentially and the
+  # tower is CPU-offloaded, so extra slots cost prefill time (~0.3 s per max-size image), not VRAM.
+  VISION_ARGS="--limit-mm-per-prompt {\"image\":{\"count\":${MAX_IMAGES:-1}}} --mm-processor-kwargs {\"size\":{\"shortest_edge\":65536,\"longest_edge\":2097152}}"
   # VISION_OFFLOAD keeps the tower's weights in pinned host RAM and copies each module to
   # the GPU for the duration of its own forward (patches/vision-tower-cpu-offload.patch).
   # It defaults ON, because on 24 GB SPEC=dflash2 + VISION=1 does not boot without it:
