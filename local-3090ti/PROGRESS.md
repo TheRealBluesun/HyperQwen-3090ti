@@ -290,3 +290,17 @@ block short, even for block-aligned prompts.
 - Agent benchmark (10 tasks x 2, default reasoning effort), per turn: already-seen re-prefill 394 -> 26 tokens
   (median 14); total 93.5K -> 5.6K tokens (-94%); follow-up TTFT median 1.21 -> 1.05 s (-13%), 32-48K prompts
   1.71 -> 1.56 s. Prompts under 16K pay ~0.05 s for the extra short prefill chunk.
+
+## Cost of a 16-token verify (for tree verification / DFLASH_TOKENS=15)
+Measured on the production tree with the verify block pinned at 16 vs the default 8, greedy, same contexts:
+32K 23.87 -> 35.56 ms/step (+49%), 64K 25.54 -> 40.53 (+59%). Kernel profile at 32K, per step: Marlin +1.3 ms,
+verify attention +2.4 ms (16 queries x 6 query heads per KV head = 96 rows, above the kernel's 64-row tile, so
+two query tiles each re-read the KV cache), GDN recurrence +1.2 ms (lazy commit cannot run at 16), kernels +22%,
+plus ~6.8 ms/step of idle gaps that the 8-token step does not have. Even after the kernel work that would remove
+most of that, a 16-token step stays ~+11-13% slower, against a measured tree-verification ceiling of +7-12%
+tokens per step on sampled text: not a win on this card.
+- DFLASH_TOKENS=15 raises the hybrid block to 944 tokens, which is not a multiple of 32, so the CUDA verify
+  attention falls back to Triton (54 ms/step at 32K). Pass `--block-size 960` (and a prefix_match_unit that
+  divides it) if you run k=15.
+- Patch 18: lazy GDN disables itself when the verify block exceeds 8 tokens; before it, k=15 with lazy GDN on
+  accepted only the first draft.

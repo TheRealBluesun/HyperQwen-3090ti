@@ -1,0 +1,11 @@
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -520,7 +520,7 @@
+         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+ 
+         from vllm.model_executor.layers.mamba.gdn import qwen27_lazy_gdn  # qwen27: lazy GDN state commit log (per layer, per request slot)
+-        if qwen27_lazy_gdn.ENABLED:
++        if qwen27_lazy_gdn.ENABLED and qwen27_lazy_gdn.check_config(get_current_vllm_config()):
+             qwen27_lazy_gdn.alloc_layer_log(self, get_current_vllm_config().scheduler_config.max_num_seqs + 2)
+         compilation_config = get_current_vllm_config().compilation_config
+         if prefix in compilation_config.static_forward_context:

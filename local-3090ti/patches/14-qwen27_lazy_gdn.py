@@ -24,6 +24,21 @@ ENABLED = os.environ.get("VLLM_QWEN27_LAZY_GDN", "0") == "1"
 FORCE_FULL = os.environ.get("VLLM_QWEN27_LAZY_GDN_FORCE_FULL", "0") == "1"   # new kernel, full layout (A/B)
 FULL_EVERY = int(os.environ.get("VLLM_QWEN27_LAZY_GDN_FULL_EVERY", "0"))       # test: force periodic full steps
 MAT_EVERY = int(os.environ.get("VLLM_QWEN27_LAZY_GDN_MAT_EVERY", "0"))         # test: force periodic materialize
+
+
+def check_config(vllm_config):
+    """Turn the feature off when the verify block can exceed 8 tokens: the per-slot log holds 8 tokens per
+    region and the replay kernel assumes it, so a longer block would break acceptance (measured: DFLASH_TOKENS=15
+    accepted only the first draft)."""
+    global ENABLED
+    spec = getattr(vllm_config, "speculative_config", None)
+    k = getattr(spec, "num_speculative_tokens", 0) or 0
+    if ENABLED and k + 1 > 8:
+        import logging
+        logging.getLogger("vllm").warning(
+            "qwen27 lazy GDN: disabled, the verify block is %d tokens (supports <= 8)", k + 1)
+        ENABLED = False
+    return ENABLED
 MARGIN_LO, MARGIN_HI = 8, 16          # V1 (exact positions)
 V2_MARGIN_LO, V2_MARGIN_HI = 32, 24   # V2: num_computed_tokens_np is an optimistic mirror (async scheduling)
 MAXB = 256

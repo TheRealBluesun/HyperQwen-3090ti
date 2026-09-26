@@ -41,3 +41,6 @@ patch -p1 -N -d "$V" < 16-dflash-keep-last-cached-block.patch
 #     hybrid fine-grained hits for any model with a sliding-window group; with this and --prefix-match-unit 32 an
 #     agent turn resumes within 32 tokens of the previous prompt instead of up to 863 tokens before it.
 patch -p1 -N -d "$V" < 17-swa-fine-grained-prefix-hits.patch
+# 18: lazy GDN (14) turns itself off when the verify block exceeds 8 tokens (DFLASH_TOKENS > 7): its per-slot log
+#     and replay kernel are sized for 8, and a 16-token block accepted only the first draft.
+patch -p1 -N -d "$V" < 18-lazy-gdn-width-guard.patch
