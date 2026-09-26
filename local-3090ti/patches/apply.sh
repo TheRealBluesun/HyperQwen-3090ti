@@ -33,3 +33,7 @@ cp 14-qwen27_gdn_rec.cu "$V/model_executor/layers/mamba/gdn/qwen27_gdn_rec.cu"
 # 15: DFlash2 lookup drafting: the context suffix scan split over 64 programs per request (was one program
 #     scanning the whole history: ~265 us/step at 100K of context). Same result exactly (max-reduction).
 patch -p1 -N -d "$V" < 15-split-suffix-lookup.patch
+# 16: prefix-cache hits keep their last block with DFlash (the EAGLE last-block drop, and the Mamba checkpoint
+#     back-off that matches it, re-prefilled 864 already-seen tokens on every agent turn).
+#     VLLM_QWEN27_DFLASH_KEEP_LAST_BLOCK=0 restores the old behaviour.
+patch -p1 -N -d "$V" < 16-dflash-keep-last-cached-block.patch

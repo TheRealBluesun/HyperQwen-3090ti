@@ -252,3 +252,22 @@ suffix scan -- a single Triton program walking the whole history -- 265 us/step.
     waiting on each other, which is also why overlap tricks don't help v7.
 - Trap: `spec_decode_attn._sda_ext()` swallows a failed JIT build and returns None, and the wrapper then runs the
   Triton kernel. Check the kernel name when benchmarking a modified `qwen27_sda.cu`.
+
+## Agent-level profile, and patch 16 (09-26)
+Real Hermes (headless, an isolated profile with memory off) on 12 synthetic coding / ops tasks against :8002, every
+LLM call timed by a logging proxy. Wall time: decode 62% (hidden reasoning alone ~49%: 77% of generated tokens are
+thinking), prefill 26%, tool execution 11%, Hermes itself 1%. Repeated tool calls ~1% -- no duplicate-work problem.
+Of the prompt tokens actually prefilled, 37% had been seen before: every prefix-cache hit came up one full 864-token
+block short, even for block-aligned prompts.
+- Cause: with a speculative method that `use_eagle()` covers (DFlash included), prefix hits drop their last block,
+  because an EAGLE drafter's KV at position p mixes in token p+1; the Mamba align checkpoint backs off one block to
+  match. DFlash's context K/V at p is a projection of the target hidden state at p alone (its grouped conv is causal
+  and applies inside draft blocks), so nothing needs dropping; target KV / SSM state are plain prefix functions.
+- Patch 16: a separate `eagle_prefix_drop` flag (false for DFlash; `VLLM_QWEN27_DFLASH_KEEP_LAST_BLOCK=0` restores
+  the drop) drives the KV-manager drop and the Mamba back-off; everything else EAGLE-related is unchanged.
+- Result, same six tasks, per LLM call: re-prefilled seen tokens 45% -> 13% of new tokens (what remains is the
+  partial tail below the next 864 boundary), new prompt tokens ~3,070 -> ~2,345, TTFT 2.81 -> 2.14 s (-24%);
+  draft acceptance unchanged (3.05 -> 3.14 accepted per step). Warm vs cold greedy outputs identical (7 of 8; the
+  eighth diverges at a near-tie), oracle scoring clean for both (max gap 0.12).
+- Remaining: the partial tail (~300 tokens per turn) needs `--prefix-match-unit`, which vLLM disables here because
+  the drafter's sliding-window group has no fine-grained lookup.

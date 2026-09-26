@@ -1,0 +1,52 @@
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import itertools
+ import time
+ from collections import defaultdict, deque
+@@ -255,6 +256,8 @@
+         )
+         speculative_config = vllm_config.speculative_config
+         self.use_eagle = False
++        # qwen27: whether prefix-cache hits drop their last block for the drafter (see below)
++        self.eagle_prefix_drop = False
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+         # Positions past the computed tokens that the drafter reads mid-prefill.
+@@ -273,6 +276,15 @@
+                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                 )
+             self.use_eagle = speculative_config.use_eagle()
++            # qwen27: EAGLE's drafter KV at position p mixes in token p+1, so a cached block's last position can
++            # carry the previous request's next token; hits therefore drop the last block, and the Mamba checkpoint
++            # backs off to match. DFlash's context K/V at p is a function of the target hidden state at p alone,
++            # so for DFlash the drop only throws away a block of prefix on every turn. Either way only drafter KV
++            # is at stake: target KV and SSM state at p depend on the prefix alone.
++            self.eagle_prefix_drop = self.use_eagle and not (
++                speculative_config.use_dflash()
++                and os.environ.get("VLLM_QWEN27_DFLASH_KEEP_LAST_BLOCK", "1") == "1"
++            )
+             if self.use_eagle:
+                 self.num_prefill_lookahead = (
+                     self.num_spec_tokens
+@@ -289,7 +301,7 @@
+             max_model_len=self.max_model_len,
+             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+             enable_caching=self.cache_config.enable_prefix_caching,
+-            use_eagle=self.use_eagle,
++            use_eagle=self.eagle_prefix_drop,
+             num_prefill_lookahead=self.num_prefill_lookahead,
+             log_stats=self.log_stats,
+             enable_kv_cache_events=self.enable_kv_cache_events,
+@@ -414,7 +426,7 @@
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+         last_cache_position = request.num_tokens - request.num_tokens % block_size
+-        if self.use_eagle:
++        if self.eagle_prefix_drop:
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
