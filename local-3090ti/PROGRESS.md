@@ -10,7 +10,7 @@ Measured with `bench27.py` (streamed, engine-neutral; medians of 3; greedy unles
 | 09-24 | HyperQwen DFlash2 CTX=long (128K) | 230 / 106 / 163 / 264 | 956 | 277 s | 52 | target base for optimization |
 | 09-24 | DFlash2 CTX=long + #1 verify-attention tuning (32 splits, 64-token tiles, 8 warps, 2 stages) | 222 / 114 / 156 / 250 | 935 | 275 s | **66** (+27%) | kernel: 109K 1,827 → 1,063 µs/layer, 14K 250 → 162, 3.3K 72 → 55 (`qwen27-dev/patches/01-spec-attn-tuning.patch`); short-context decode within noise |
 | 09-24 | + #2 prefill-attention tuning for sm86 (128-row blocks, 128-token tiles, 8 warps; chunks ≥128 tokens) | 233 / 120 / 165 / 265 | ~1,060 | **162 s** (1.7x) | 62–66 | kernel: 12–13 → 30–33 TFLOP/s, 2.4–2.7x per prefill chunk (`patches/02-unified-attn-sm86-prefill.patch`) |
-| 09-24 | #3a narrow split-K GEMM for GDN in_proj_ba (N=96) | — | — | — | — | **no gain**: cuBLAS GEMM+reduce 5.4 µs vs narrow 5.3 µs at M=8 in isolation; reverted (`patches/rejected-03-*`) |
+| 09-24 | #3a narrow split-K GEMM for GDN in_proj_ba (N=96) | — | — | — | — | **no gain**: cuBLAS GEMM+reduce 5.4 µs vs narrow 5.3 µs at M=8 in isolation; reverted (the patch is in git history) |
 | 09-24 | #4a DFLASH_TOKENS=15 at 128K | — | — | — | — | **doesn't fit**: needs 5.73 GiB KV vs 5.19 pinned; raising KV_MEM to 5.8 GiB OOMs on the verify graphs |
 | 09-24 | **service switched to DFlash2 CTX=long (128K) + patches 01+02** | 233 / 120 / 165 / 265 | ~1,060 | 162 s | 62–66 | vs the MTP-150K service: short/medium prompts 1.5–1.9x faster; ~109K still slower (134 s / 75 tok/s) |
 

@@ -7,9 +7,13 @@ Conflicts=buun-27b-b.service
 # Pinned KV pool 176 MiB under the profile default (5583457484): still 131,328 tokens (>= 128K) but leaves
 # activation headroom. At the default, two concurrent prefills OOMed the 3090 Ti by 24 MiB (2026-09-25).
 Environment=KV_MEM=5398908108
-# vLLM overlay with patches 03-12 (a copy of the venv package; see local-3090ti/patches) + the Marlin M<=16 table (patch 08)
+# vLLM overlay: a copy of the venv package with local-3090ti/patches 03-18 applied, + the Marlin M<=16 table (patch 08)
 Environment=PYTHONPATH=%h/build/HyperQwen/dev/site
 Environment=VLLM_MARLIN_TUNE=1
+# Patch 14: lazy GDN state commit (bit-identical; turns itself off above an 8-token verify block)
+Environment=VLLM_QWEN27_LAZY_GDN=1
+# Vision tower on, weights offloaded to pinned host RAM (MAX_IMAGES=N allows N images per prompt, default 1)
+Environment=VISION=1
 Type=simple
 Environment=GPU=1
 Environment=PORT=8002

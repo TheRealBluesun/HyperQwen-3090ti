@@ -54,7 +54,7 @@ def stream(messages, max_tokens, sampled):
 MODEL = model_id()
 res = {"label": LABEL, "url": URL, "model": MODEL, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "runs": []}
 stream([{"role": "user", "content": "Say hi."}], 8, False)  # warm-up
-for sampled in (() if os.environ.get('ONLY_LONG') == '1' else (False, True)):
+for sampled in (() if os.environ.get('ONLY_LONG') == '1' else ((False,) if os.environ.get('ONLY_GREEDY') == '1' else (False, True))):
     for name, p in PROMPTS.items():
         for rep in range(REPS):
             x = stream([{"role": "user", "content": p}], 128 if name == "short" else 600, sampled)
@@ -62,7 +62,7 @@ for sampled in (() if os.environ.get('ONLY_LONG') == '1' else (False, True)):
             print(f"{'sampled' if sampled else 'greedy '} {name:8s} rep{rep}: {x['completion_tokens']:4d} tok  decode {x['decode_tps'] or 0:6.1f} tok/s  ttft {x['ttft']:.2f}s  {x['ms_per_step'] or 0:5.2f} ms/step  {x['tok_per_step'] or 0:4.2f} tok/step", flush=True)
 # prefill: unique 16K-token-ish prompt per rep (defeats prefix caching)
 base = open(os.path.join(HERE, "longtext.txt")).read()
-for rep in range(0 if os.environ.get('ONLY_LONG') == '1' else 2):
+for rep in range(0 if os.environ.get('ONLY_LONG') == '1' or os.environ.get('ONLY_GREEDY') == '1' else 2):
     txt = f"[run {time.time()}]\n" + base
     x = stream([{"role": "user", "content": txt + "\n\nSummarize the above in three bullet points."}], 64, False)
     x.update(name="prefill16k", sampled=False, rep=rep); res["runs"].append(x)

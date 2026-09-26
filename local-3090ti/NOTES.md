@@ -46,7 +46,7 @@ Output: median 300 tokens, p90 1.3K. Both slots used (some concurrency). => 128K
 short-context decode dominates; long context matters for ~7% of requests.
 
 Profile: HyperQwen SPEC=dflash2 CTX=long (128K, int8 KV), nsys (copied to ~/tools/nsight-systems on .15),
-`prof_a.sh` + `capture27.py`, reports in prof/p1-dflash2/.
+nsys via `deploy/dev_prof.sh` (capture ranges through /start_profile and /stop_profile).
 - Short-context decode (300 tokens): GPU 95% busy, 75 target steps (4.0 tokens/step), ~24 ms/step.
   Marlin W4A16 GEMMs 18.5 ms/step (~75–80% of DRAM bandwidth for ~14.3 GB of target + drafter weights
   per step); GDN recurrence ~1 ms; a 128 µs bf16 GEMM per step; small elementwise/norms; ~1.2 ms idle.
