@@ -316,3 +316,17 @@ Profile at 32K context (k=7): 23.65 ms/step of kernels in 1,126 launches; outsid
   and the persistent-kernel prototype measured slower. With the weight GEMMs at ~92% of the read floor, verify
   attention near its limit and wider verification not paying (above), single-card decode is at its practical
   ceiling for lossless changes.
+
+## Where it ended: as cloned vs now (RTX 3090 Ti, bench27.py with the 109K test, greedy medians)
+| metric | HyperQwen as cloned (DFlash2, 128K) | with patches 01-18 | change |
+|---|---|---|---|
+| decode, code | 230 tok/s | 266 | 1.16x |
+| decode, prose | 106 | 132 | 1.25x |
+| decode, explain | 163 | 193 | 1.19x |
+| decode, json | 264 | 305 | 1.16x |
+| prefill, 18K prompt | 956 tok/s | 1,313 | 1.37x |
+| prefill, 109K prompt | 277 s (395 tok/s) | 113.6 s (962 tok/s) | 2.44x |
+| decode after 109K of context | 52 tok/s | 94 | 1.81x |
+The baseline was measured at a 300 W power cap and the final numbers at 350 W, so part of the short-context
+decode gain is power. For agent workloads the prefix-cache patches (16, 17) matter as much as raw speed: an agent
+turn now re-prefills ~26 already-seen tokens instead of ~394 (and a full 864-token block more before patch 16).
