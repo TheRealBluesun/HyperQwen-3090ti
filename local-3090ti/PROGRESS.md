@@ -349,3 +349,15 @@ carries lm_head, drafter and sampling), so short-context decode is ~7-10% behind
 communication gap left to remove. Layer split and stage order make no difference (22.65-22.87 ms/step).
 Loading uses vLLM's own loader under PP: the Run:ai streamer runs a collective over all ranks on every load, and the
 drafter loads on the last rank only.
+
+### PP=2: the per-step fat was a device sync (patch 20)
+nsys at short context showed ~2.1 ms per step with neither GPU computing; the last stage's GPU sat idle while its
+CPU launched sampling post-processing and drafter prep one small kernel at a time. py-spy on that worker: ~35% of
+its main thread in the PP need-sampled mask, which read a GPU tensor (`.to("cpu")`) and so waited for the whole
+forward pass every step. The mask is now CPU-only and identical on both ranks (as in upstream vLLM).
+| ms/step | one card | PP=2 before | PP=2 after |
+|---|---|---|---|
+| short context | 20.87 | 22.46 | 21.41 |
+| 32K | 23.87 | 23.89 | 22.87 |
+| 100K | 27.81 | 27.25 | 26.20 |
+Decode code / prose / explain / json: 250 / 127 / 187 / 295 tok/s (one card 266 / 132 / 193 / 305).

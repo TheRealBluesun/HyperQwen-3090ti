@@ -1,0 +1,194 @@
+diff --git a/v1/worker/gpu/input_batch.py b/v1/worker/gpu/input_batch.py
+index 9a574a4..810d661 100644
+--- a/v1/worker/gpu/input_batch.py
++++ b/v1/worker/gpu/input_batch.py
+@@ -85,7 +85,8 @@ class InputBatch:
+     # == np.any(is_prefilling_np)
+     has_prefill: bool
+ 
+-    # [num_reqs] only populated when pipeline parallelism is enabled.
++    # [num_reqs] always None. The PP sample mask does not read it.
++    # qwen27-pp: PCP still copies the field through when it is set.
+     max_seq_len_np: np.ndarray | None
+ 
+     # [num_tokens_after_padding]
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index 4c250d1..9b41e22 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -1345,11 +1345,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+ 
+-        max_seq_len_np = None
+-        if self.use_pp:
+-            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
+-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
+-
+         prompt_lens = None
+         if self.model_config.rswa_window is not None:
+             # prompt_lens is only used in R-SWA case.
+@@ -1378,7 +1373,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
+             is_prefilling_np=batch_req_state.is_prefilling_np,
+             has_prefill=batch_req_state.has_prefill,
+-            max_seq_len_np=max_seq_len_np,
++            # qwen27-pp: the PP sample mask no longer reads max seq len.
++            max_seq_len_np=None,
+             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+             positions=self.input_buffers.positions[:num_tokens_after_padding],
+             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
+@@ -1873,7 +1869,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+             num_computed_gpu = self.req_states.num_computed_tokens.gpu
+-            all_decode_next = self.pp_handler.receive(input_batch, num_computed_gpu)
++            all_decode_next = self.pp_handler.receive(input_batch)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -1918,7 +1914,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 num_sampled,
+                 num_rejected,
+                 input_batch,
+-                self.req_states.num_computed_tokens.gpu,
+             )
+ 
+         assert self.prompt_logprobs_worker is not None
+@@ -2036,7 +2031,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.pp_handler.broadcast_drafts(
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                 input_batch,
+-                self.req_states.num_computed_tokens.gpu,
+             )
+         return async_output
+ 
+diff --git a/v1/worker/gpu/pp_utils.py b/v1/worker/gpu/pp_utils.py
+index 05a831d..2cf35f0 100644
+--- a/v1/worker/gpu/pp_utils.py
++++ b/v1/worker/gpu/pp_utils.py
+@@ -38,7 +38,6 @@ class PendingRecv:
+ 
+ def compute_need_sampled_mask(
+     input_batch: InputBatch,
+-    num_computed_tokens_gpu: torch.Tensor | None = None,
+ ) -> np.ndarray | None:
+     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
+     with outputs that might be needed in a subsequent (decode) step.
+@@ -46,31 +45,13 @@ def compute_need_sampled_mask(
+ 
+     old_computed = input_batch.num_computed_tokens_np
+     prefill_len = input_batch.prefill_len_np
+-    max_seq_len = input_batch.max_seq_len_np
+-    assert max_seq_len is not None  # always populated under PP
+-    # qwen27-pp: the scheduler CPU count includes spec-decode placeholders, so
+-    # it can sit up to num_speculative_tokens ahead of the committed GPU count.
+-    # not_finishing must use the GPU count (identical on every rank at
+-    # broadcast/receive time) or a request that still has room skips the
+-    # broadcast and the non-last rank repeats a stale step.
+-    if num_computed_tokens_gpu is None:
+-        committed = old_computed
+-    else:
+-        n = old_computed.shape[0]
+-        idx = input_batch.idx_mapping[:n].to(dtype=torch.long)
+-        committed = (
+-            num_computed_tokens_gpu.index_select(0, idx)
+-            .detach()
+-            .to("cpu")
+-            .numpy()
+-            .reshape(-1)
+-        )
+     # Exclude non-final prefill chunks (they don't produce a sample).
++    # qwen27-pp: CPU-only, identical on every rank. The finishing check read
++    # the GPU token count and synced the device every step. Broadcasting a
++    # request that is about to finish is harmless; generation counters drop
++    # freed rows on the receiver.
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+-    # Exclude requests that we know are finished.
+-    not_finishing = np.maximum(committed, prefill_len) + 1 < max_seq_len
+-    need_sampled_mask = produces_sample & not_finishing
+-    return need_sampled_mask if need_sampled_mask.any() else None
++    return produces_sample if produces_sample.any() else None
+ 
+ 
+ def _pack_pp_step(
+@@ -160,9 +141,8 @@ class PPHandler:
+         self.broadcast_group = get_pp_group().make_sibling_device_group(
+             group_desc="pp_broadcast"
+         )
+-        # qwen27-pp: broadcast() only snapshots. broadcast_drafts sends one
+-        # packed buffer after propose(). Reuse broadcast()'s mask: postprocess
+-        # updates the GPU token count and can flip a recomputed one.
++        # qwen27-pp: broadcast() snapshots the CPU sample mask. broadcast_drafts
++        # sends one packed buffer after propose() and reuses that decision.
+         self._broadcast_this_step = False
+         self._pending_packed: torch.Tensor | None = None
+ 
+@@ -189,6 +169,11 @@ class PPHandler:
+         if exclude_mask.any():
+             if exclude_mask.all():
+                 # No states require update anymore.
++                # qwen27-pp: a request that hits its length cap is broadcast
++                # and then freed before this consume. The recv still owns
++                # these buffers on the side stream; freeing them from the
++                # CPU without waiting is an illegal device access.
++                slot.event.synchronize()
+                 return None
+             # Filter excluded request indices.
+             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
+@@ -206,14 +191,11 @@ class PPHandler:
+     def receive(
+         self,
+         input_batch: InputBatch,
+-        num_computed_tokens_gpu: torch.Tensor | None = None,
+     ) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+         requests in the batch."""
+         assert not self.is_last_rank
+-        need_sampled_mask = compute_need_sampled_mask(
+-            input_batch, num_computed_tokens_gpu
+-        )
++        need_sampled_mask = compute_need_sampled_mask(input_batch)
+         if need_sampled_mask is None:
+             # Leave this step's reserved slot as None.
+             return False
+@@ -266,10 +248,9 @@ class PPHandler:
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
+         input_batch: InputBatch,
+-        num_computed_tokens_gpu: torch.Tensor | None = None,
+     ) -> None:
+         assert self.is_last_rank
+-        need = compute_need_sampled_mask(input_batch, num_computed_tokens_gpu)
++        need = compute_need_sampled_mask(input_batch)
+         self._broadcast_this_step = need is not None
+         self._pending_packed = None
+         if need is None:
+@@ -307,14 +288,11 @@ class PPHandler:
+         self,
+         draft_tokens: torch.Tensor,
+         input_batch: InputBatch,
+-        num_computed_tokens_gpu: torch.Tensor | None = None,
+     ) -> None:
+         """Send this step's sample, counts, and draft ids in one broadcast.
+ 
+         Call after the drafter has written `draft_tokens`. No-op when
+-        `broadcast` decided this step has nothing to send. The mask is not
+-        recomputed: `num_computed_tokens_gpu` is ignored because postprocess
+-        may already have advanced it.
++        `broadcast` decided this step has nothing to send.
+         """
+         assert self.is_last_rank
+         # qwen27-pp: non-last ranks have no drafter, so their draft buffer stays
+@@ -346,6 +324,11 @@ class PPHandler:
+                 src=self.last_rank,
+                 group=self.broadcast_group,
+             )
++            # qwen27-pp: packed is allocated on the main stream and consumed
++            # here. Without record_stream the caching allocator reuses it
++            # while NCCL is still reading, which is an illegal device access
++            # once a length-capped step is broadcast at request teardown.
++            packed.record_stream(self.broadcast_stream)
+         self._pending_packed = None
+ 
+ 

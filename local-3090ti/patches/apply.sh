@@ -48,3 +48,7 @@ patch -p1 -N -d "$V" < 18-lazy-gdn-width-guard.patch
 #     across the stage boundary, embedding shared on the last rank, one packed sampled/draft broadcast per step,
 #     drafts scattered on earlier ranks. A no-op at PP=1. Deploy with deploy/hyperqwen-pp.service.
 patch -p1 -N -d "$V" < 19-pipeline-parallel-dflash.patch
+# 20: PP need-sampled mask computed on the CPU only (it read a GPU token count, a device sync every step that kept
+#     the last stage's CPU from queueing sampling and drafter prep during the forward pass: ~1 ms/step), plus two
+#     buffer-lifetime fixes in the PP broadcast (record_stream on the packed send; wait before freeing an unused recv).
+patch -p1 -N -d "$V" < 20-pp-mask-no-gpu-sync.patch
