@@ -330,3 +330,22 @@ Profile at 32K context (k=7): 23.65 ms/step of kernels in 1,126 launches; outsid
 The baseline was measured at a 300 W power cap and the final numbers at 350 W, so part of the short-context
 decode gain is power. For agent workloads the prefix-cache patches (16, 17) matter as much as raw speed: an agent
 turn now re-prefills ~26 already-seen tokens instead of ~394 (and a full 864-token block more before patch 16).
+
+## One endpoint over both cards: DFlash2 under pipeline parallel (patch 19)
+On this box (PCIe 3.0 x8 per card, no GPU-to-GPU P2P) tensor parallel is ruled out: each GPU moves only ~5.5 GB/s
+through host memory, so the ~128 all-reduces per decode step cost ~4 ms. Pipeline parallel needs one ~80 KB handoff
+per step. Stock vLLM refused DFlash under PP; patch 19 makes it work (upstream main has since fixed the same issues
+independently). Correctness: greedy output vs a single-card reference differs only at exact / near ties (reference
+top-2 margin 0-0.125 nats, the run picks the reference's second choice); a single 3090 matches the 3090 Ti exactly.
+Measured on the deployed service (bench27 with the 109K test, greedy):
+| | one card (3090 Ti) | PP=2 (both cards) |
+|---|---|---|
+| decode, code / prose / explain / json | 266 / 132 / 193 / 305 tok/s | 247 / 118 / 182 / 281 |
+| 109K cold prefill | 113.6 s | 62.0 s (1.83x) |
+| decode after 109K | 94 tok/s | 101.8 |
+| KV pool | 136K tokens | 471K (vision on) |
+A single stream is the sum of the two halves (profile: ~9.3 ms on the first card, ~13.1 ms on the second, which also
+carries lm_head, drafter and sampling), so short-context decode is ~7-10% behind one card; there is no
+communication gap left to remove. Layer split and stage order make no difference (22.65-22.87 ms/step).
+Loading uses vLLM's own loader under PP: the Run:ai streamer runs a collective over all ranks on every load, and the
+drafter loads on the last rank only.

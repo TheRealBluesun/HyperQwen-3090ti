@@ -1,0 +1,30 @@
+[Unit]
+Description=HyperQwen (patched vLLM 0.29) Qwen3.8-27B W4A16, pipeline parallel over both GPUs (PP=2, 128k ctx, DFlash2, port 8001)
+After=network.target
+Conflicts=hyperqwen-a.service hyperqwen-b.service buun-27b-a.service buun-27b-b.service
+
+[Service]
+Environment=GPU=0,1
+Environment=PORT=8001
+# vLLM overlay: a copy of the venv package with local-3090ti/patches 03-19 applied, + the Marlin M<=16 table (patch 08)
+Environment=PYTHONPATH=%h/build/HyperQwen/dev/site
+Environment=VLLM_MARLIN_TUNE=1
+# Patch 14: lazy GDN state commit (bit-identical; turns itself off above an 8-token verify block)
+Environment=VLLM_QWEN27_LAZY_GDN=1
+# Vision tower on, weights offloaded to pinned host RAM; up to 32 images per prompt
+Environment=VISION=1
+Environment=MAX_IMAGES=32
+# PP spreads the weights over two cards: do not pin the single-card KV pool.
+Environment=KV_MEM=
+# Run:ai's streamer runs a collective over ALL ranks on every load (even with its distributed mode off), and the
+# DFlash drafter loads on the last PP rank only -> hang. Use vLLM's own loader under PP.
+Environment=RUNAI_STREAMER_DIST=0
+Environment="EXTRA_ARGS_ADD=--pipeline-parallel-size 2 --load-format auto --model-loader-extra-config {}"
+Type=simple
+ExecStart=%h/build/HyperQwen/local-3090ti/deploy/run.sh
+Restart=always
+RestartSec=10
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

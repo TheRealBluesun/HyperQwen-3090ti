@@ -1,0 +1,721 @@
+diff --git a/config/speculative.py b/config/speculative.py
+index fde84a2..c5556b8 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -1489,9 +1489,19 @@ class SpeculativeConfig:
+                     )
+                 )
+ 
++                # qwen27-pp: the dflash drafter is built whole on the last rank
++                # and is never pipeline-split, so its parallel config is pp=1.
++                # That skips the SupportsPP check. Other methods keep target pp.
++                draft_pipeline_parallel_size = (
++                    1
++                    if self.method == "dflash"
++                    else self.target_parallel_config.pipeline_parallel_size
++                )
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+-                        self.target_parallel_config, self.draft_tensor_parallel_size
++                        self.target_parallel_config,
++                        self.draft_tensor_parallel_size,
++                        draft_pipeline_parallel_size,
+                     )
+                 )
+ 
+@@ -1681,13 +1691,17 @@ class SpeculativeConfig:
+     def create_draft_parallel_config(
+         target_parallel_config: ParallelConfig,
+         speculative_draft_tensor_parallel_size: int,
++        pipeline_parallel_size: int | None = None,
+     ) -> ParallelConfig:
+         """Create a parallel config for use by the draft worker.
+ 
+         This is mostly a copy of the target parallel config, except the tp_size.
+         """
++        # qwen27-pp: None keeps the target pipeline size. Dflash passes 1.
++        if pipeline_parallel_size is None:
++            pipeline_parallel_size = target_parallel_config.pipeline_parallel_size
+         draft_parallel_config = ParallelConfig(
+-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            pipeline_parallel_size=pipeline_parallel_size,
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+diff --git a/model_executor/models/qwen3_5.py b/model_executor/models/qwen3_5.py
+index fe96098..10f7b4d 100644
+--- a/model_executor/models/qwen3_5.py
++++ b/model_executor/models/qwen3_5.py
+@@ -242,6 +242,9 @@ class Qwen3_5Model(Qwen3NextModel):
+ 
+         self.vocab_size = config.vocab_size
+ 
++        # qwen27-pp: embed_tokens stays a real module on every rank, including
++        # the last PP rank, so weight loading fills it and the drafter there
++        # can share it. Target forward still embeds only on the first rank.
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
+@@ -264,10 +267,27 @@ class Qwen3_5Model(Qwen3NextModel):
+             Qwen3NextSparseMoeBlock,
+             "mlp",
+         )
+-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++        # qwen27-pp: aux layer ids are assigned after __init__, so the aux_*
++        # receive keys are chosen when the buffers are created, not here.
++        _base_intermediate_tensors = make_empty_intermediate_tensors_factory(
+             ["hidden_states", "residual"], config.hidden_size
+         )
+ 
++        def make_empty_intermediate_tensors(
++            batch_size: int,
++            dtype: torch.dtype,
++            device: torch.device,
++        ) -> IntermediateTensors:
++            tensors = _base_intermediate_tensors(batch_size, dtype, device)
++            hidden_size = config.hidden_size
++            for idx in self._pp_earlier_aux_indices():
++                tensors[f"aux_{idx}"] = torch.zeros(
++                    (batch_size, hidden_size), dtype=dtype, device=device
++                )
++            return tensors
++
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
++
+         if get_pp_group().is_last_rank:
+             self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         else:
+diff --git a/model_executor/models/qwen3_next.py b/model_executor/models/qwen3_next.py
+index 2b16a2e..46074eb 100644
+--- a/model_executor/models/qwen3_next.py
++++ b/model_executor/models/qwen3_next.py
+@@ -679,6 +679,71 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def _pp_local_aux_indices(self) -> list[int]:
++        """Aux indices this PP rank collects, in increasing order."""
++        layers = self.aux_hidden_state_layers
++        indices: list[int] = []
++        # qwen27-pp: index 0 is the embedding output; only rank 0 emits it.
++        if get_pp_group().is_first_rank and 0 in layers:
++            indices.append(0)
++        for layer_idx in range(self.start_layer, self.end_layer):
++            aux_idx = layer_idx + 1
++            if aux_idx in layers:
++                indices.append(aux_idx)
++        return indices
++
++    def _pp_earlier_aux_indices(self) -> list[int]:
++        """Aux indices earlier PP stages already collected.
++
++        Index 0 is included only when it is configured, which is exactly when
++        the first rank collects the embedding output.
++        """
++        # qwen27-pp: receive buffers for aux snapshots from earlier stages.
++        pp_group = get_pp_group()
++        if pp_group.world_size == 1 or pp_group.is_first_rank:
++            return []
++        return sorted(
++            idx for idx in self.aux_hidden_state_layers if idx <= self.start_layer
++        )
++
++    def _pp_aux_tensors_so_far(
++        self,
++        intermediate_tensors: IntermediateTensors | None,
++        local_aux: list[torch.Tensor],
++    ) -> dict[str, torch.Tensor]:
++        # qwen27-pp: one key per aux index collected up to and including this stage.
++        out: dict[str, torch.Tensor] = {}
++        if intermediate_tensors is not None:
++            for key, value in intermediate_tensors.tensors.items():
++                if key.startswith("aux_"):
++                    out[key] = value
++        local_indices = self._pp_local_aux_indices()
++        assert len(local_indices) == len(local_aux), (
++            f"aux index/tensor mismatch: {local_indices} vs {len(local_aux)}"
++        )
++        for idx, tensor in zip(local_indices, local_aux):
++            out[f"aux_{idx}"] = tensor
++        return out
++
++    def _pp_merge_aux(
++        self,
++        intermediate_tensors: IntermediateTensors,
++        local_aux: list[torch.Tensor],
++    ) -> list[torch.Tensor]:
++        # qwen27-pp: upstream aux then this stage's, in increasing index order.
++        upstream: list[tuple[int, torch.Tensor]] = []
++        for key, value in intermediate_tensors.tensors.items():
++            if key.startswith("aux_"):
++                upstream.append((int(key[4:]), value))
++        upstream.sort(key=lambda item: item[0])
++        local_indices = self._pp_local_aux_indices()
++        assert len(local_indices) == len(local_aux), (
++            f"aux index/tensor mismatch: {local_indices} vs {len(local_aux)}"
++        )
++        merged = upstream + list(zip(local_indices, local_aux))
++        merged.sort(key=lambda item: item[0])
++        return [tensor for _, tensor in merged]
++
+     @property
+     def use_sequence_parallel(self) -> bool:
+         return self.layers[self.start_layer].use_attn_reduce_scatter_for_moe
+@@ -690,7 +755,8 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+-        if get_pp_group().is_first_rank:
++        pp_group = get_pp_group()
++        if pp_group.is_first_rank:
+             if inputs_embeds is not None:
+                 hidden_states = inputs_embeds
+             else:
+@@ -698,6 +764,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+             residual = None
+         else:
+             assert intermediate_tensors is not None
++            # qwen27-pp: non-first ranks, including the last, consume the
++            # previous stage. They do not embed, even when embed_tokens is a
++            # real module so the drafter on the last rank can share it.
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+@@ -706,7 +775,15 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+             hidden_states = sequence_parallel_chunk(hidden_states)
+             assert residual is None
+ 
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        # qwen27-pp: aux index 0 is the embedding output and is collected only
++        # on the first rank. A later rank's input is the previous stage's
++        # output; if that boundary is an aux index, that stage already sent it.
++        if pp_group.is_first_rank:
++            aux_hidden_states = self._maybe_add_hidden_state(
++                [], 0, hidden_states, residual
++            )
++        else:
++            aux_hidden_states = []
+         for layer_idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+@@ -720,11 +797,23 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+                 aux_hidden_states, layer_idx + 1, hidden_states, residual
+             )
+ 
+-        if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
+-            )
++        if not pp_group.is_last_rank:
++            tensors = {"hidden_states": hidden_states, "residual": residual}
++            # qwen27-pp: carry aux snapshots collected so far to the next stage.
++            if pp_group.world_size > 1:
++                tensors.update(
++                    self._pp_aux_tensors_so_far(
++                        intermediate_tensors, aux_hidden_states
++                    )
++                )
++            return IntermediateTensors(tensors)
+         hidden_states, _ = self.norm(hidden_states, residual)
++        # qwen27-pp: last rank returns upstream aux followed by local aux,
++        # in increasing index order (the order the drafter expects).
++        if pp_group.world_size > 1 and intermediate_tensors is not None:
++            aux_hidden_states = self._pp_merge_aux(
++                intermediate_tensors, aux_hidden_states
++            )
+         if self.use_sequence_parallel:
+             if aux_hidden_states:
+                 hidden_size = hidden_states.shape[-1]
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index d156d84..4c250d1 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -132,7 +132,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
+ from vllm.v1.worker.gpu.model_states import init_model_state
+ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+-from vllm.v1.worker.gpu.pp_utils import PPHandler
++from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
+ from vllm.v1.worker.gpu.sample.batch_shard import (
+     BatchSharder,
+     all_to_all_logits,
+@@ -266,9 +266,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 "dspark",
+                 "extract_hidden_states",
+             ):
+-                # Drafting may require auxiliary hidden states from target model outputs
++                # Drafting may require auxiliary hidden states from target model outputs.
++                # qwen27-pp: dflash collects those states on every PP rank and
++                # carries them across the stage boundary. The other methods stay
++                # unsupported under pipeline parallel.
+                 self.use_aux_hidden_state_outputs = True
+-                if self.use_pp:
++                if self.use_pp and self.speculative_config.method != "dflash":
+                     raise ValueError(
+                         f"{self.speculative_config.method} with pipeline parallel "
+                         "is not supported."
+@@ -394,6 +397,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+             if self.use_aux_hidden_state_outputs:
+                 assert self.speculative_config is not None
++                # qwen27-pp: every PP rank needs the aux layer ids so it can
++                # collect the ones in its stage and forward the rest.
+                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 with use_workspace_lane(self._draft_workspace_lane):
+@@ -488,6 +493,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # for the max capture size so they can be sliced per batch.
+             # Save as persistent member so runtime can copy received data
+             # into the same addresses that the CUDA graphs captured.
++            # qwen27-pp: this stays after set_eagle3_aux_hidden_state_layers so
++            # the aux_* receive keys see the configured layers.
+             self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                 batch_size=self.max_num_tokens,
+                 dtype=self.model_config.dtype,
+@@ -1025,7 +1032,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                # qwen27-pp: draft ids travel with the sampled-token slot. Pop
++                # them before postprocess_sampled, which does not take them.
++                draft_tokens = outputs.pop("draft_tokens", None)
+                 self.postprocess_sampled(**outputs)
++                if draft_tokens is not None:
++                    scatter_draft_tokens(
++                        outputs["idx_mapping"],
++                        draft_tokens,
++                        self.req_states.draft_tokens,
++                    )
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -1856,14 +1872,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # IntermediateTensors instead of final hidden states. Receive the
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+-            all_decode_next = self.pp_handler.receive(input_batch)
++            num_computed_gpu = self.req_states.num_computed_tokens.gpu
++            all_decode_next = self.pp_handler.receive(input_batch, num_computed_gpu)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+             if not all_decode_next:
+                 # Might contain non-final prefill chunks, which will be scheduled
+                 # in the immediate next step (rather than in pp_size steps).
+-                self.model_state.postprocess_state(input_batch.idx_mapping, 0)
++                # qwen27-pp: a pure prefill chunk is not deferred, so run the
++                # same align postprocess the last rank runs. Mixed batches keep
++                # the old call (num_computed=None) and fix state when the
++                # sampled-token slot is consumed.
++                nd = input_batch.num_draft_tokens_per_req
++                nreq = input_batch.num_reqs
++                pure_prefill = (
++                    nd is None or nreq == 0 or int(np.max(nd[:nreq])) <= 0
++                )
++                self.model_state.postprocess_state(
++                    input_batch.idx_mapping,
++                    0,
++                    num_computed_gpu if pure_prefill else None,
++                )
+ 
+             # Post-step KV connector related operations.
+             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+@@ -1881,12 +1911,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+ 
+         if self.pp_handler is not None:
+-            # Broadcast to non-last PP ranks (handles spec decode multi-token).
++            # qwen27-pp: snapshot only. The NCCL send is broadcast_drafts,
++            # after propose(), packed with the draft ids.
+             self.pp_handler.broadcast(
+                 sampler_output.sampled_token_ids,
+                 num_sampled,
+                 num_rejected,
+                 input_batch,
++                self.req_states.num_computed_tokens.gpu,
+             )
+ 
+         assert self.prompt_logprobs_worker is not None
+@@ -1998,6 +2030,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         model_runner_output.kv_connector_output = kv_connector_output
+         model_runner_output.ec_connector_output = ec_connector_output
+ 
++        if self.pp_handler is not None:
++            # qwen27-pp: one packed broadcast (samples, counts, drafts) after
++            # propose(), so the draft ids match what this rank stored.
++            self.pp_handler.broadcast_drafts(
++                self.req_states.draft_tokens[input_batch.idx_mapping],
++                input_batch,
++                self.req_states.num_computed_tokens.gpu,
++            )
+         return async_output
+ 
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+diff --git a/v1/worker/gpu/pp_utils.py b/v1/worker/gpu/pp_utils.py
+index 9b1786c..05a831d 100644
+--- a/v1/worker/gpu/pp_utils.py
++++ b/v1/worker/gpu/pp_utils.py
+@@ -10,6 +10,7 @@ import torch
+ 
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ 
+@@ -30,9 +31,15 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # qwen27-pp: draft ids proposed on the last rank this step. None when spec
++    # decode is off. Installed on non-last ranks when this slot is consumed.
++    draft_tokens: torch.Tensor | None = None
+ 
+ 
+-def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
++def compute_need_sampled_mask(
++    input_batch: InputBatch,
++    num_computed_tokens_gpu: torch.Tensor | None = None,
++) -> np.ndarray | None:
+     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
+     with outputs that might be needed in a subsequent (decode) step.
+     Returns None if no sampled outputs are needed in the requests' next step."""
+@@ -41,14 +48,77 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+     prefill_len = input_batch.prefill_len_np
+     max_seq_len = input_batch.max_seq_len_np
+     assert max_seq_len is not None  # always populated under PP
++    # qwen27-pp: the scheduler CPU count includes spec-decode placeholders, so
++    # it can sit up to num_speculative_tokens ahead of the committed GPU count.
++    # not_finishing must use the GPU count (identical on every rank at
++    # broadcast/receive time) or a request that still has room skips the
++    # broadcast and the non-last rank repeats a stale step.
++    if num_computed_tokens_gpu is None:
++        committed = old_computed
++    else:
++        n = old_computed.shape[0]
++        idx = input_batch.idx_mapping[:n].to(dtype=torch.long)
++        committed = (
++            num_computed_tokens_gpu.index_select(0, idx)
++            .detach()
++            .to("cpu")
++            .numpy()
++            .reshape(-1)
++        )
+     # Exclude non-final prefill chunks (they don't produce a sample).
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+     # Exclude requests that we know are finished.
+-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
++    not_finishing = np.maximum(committed, prefill_len) + 1 < max_seq_len
+     need_sampled_mask = produces_sample & not_finishing
+     return need_sampled_mask if need_sampled_mask.any() else None
+ 
+ 
++def _pack_pp_step(
++    sampled_tokens: torch.Tensor,
++    num_sampled: torch.Tensor,
++    num_rejected: torch.Tensor,
++    draft_width: int,
++) -> torch.Tensor:
++    """One int64 row per request: tokens, two counts, then draft ids.
++
++    Layout is [n, (k+1) + 2 + k]. Draft columns stay 0 until the sender
++    fills them after propose(). Counts are widened from int32; the receiver
++    narrows them back.
++    """
++    # qwen27-pp: one buffer so the step pays for a single NCCL broadcast.
++    n, k1 = sampled_tokens.shape
++    packed = torch.zeros(
++        n, k1 + 2 + draft_width, dtype=torch.int64, device=sampled_tokens.device
++    )
++    packed[:, :k1] = sampled_tokens
++    packed[:, k1] = num_sampled.to(dtype=torch.int64)
++    packed[:, k1 + 1] = num_rejected.to(dtype=torch.int64)
++    return packed
++
++
++def _owned_rows(view: torch.Tensor) -> torch.Tensor:
++    """Dense copy. A 1-row slice of the packed buffer stays a view."""
++    # qwen27-pp: n=1 is "contiguous" but keeps the parent stride and storage.
++    # The deferred postprocess reads it pp_size steps later; under a long
++    # prefill the caching allocator reuses that storage first.
++    out = torch.empty(view.shape, dtype=view.dtype, device=view.device)
++    out.copy_(view)
++    return out
++
++
++def _unpack_pp_step(
++    packed: torch.Tensor, sample_len: int, draft_width: int
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
++    """Inverse of `_pack_pp_step`. Counts come back as int32."""
++    sampled_tokens = _owned_rows(packed[:, :sample_len])
++    num_sampled = _owned_rows(packed[:, sample_len].to(dtype=torch.int32))
++    num_rejected = _owned_rows(packed[:, sample_len + 1].to(dtype=torch.int32))
++    draft_tokens = None
++    if draft_width > 0:
++        draft_tokens = _owned_rows(packed[:, sample_len + 2 :])
++    return sampled_tokens, num_sampled, num_rejected, draft_tokens
++
++
+ class PPHandler:
+     """Runs the PP sampled-token broadcast/recv on a side stream so the
+     default stream isn't gated by the matching peer call. Step T's recv is
+@@ -65,6 +135,10 @@ class PPHandler:
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
++        # qwen27-pp: draft ids are proposed only on the last rank. Carry them
++        # with the sampled-token broadcast so earlier ranks can feed the same
++        # tokens into the next verify step.
++        self.draft_width = num_speculative_steps
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+@@ -86,6 +160,11 @@ class PPHandler:
+         self.broadcast_group = get_pp_group().make_sibling_device_group(
+             group_desc="pp_broadcast"
+         )
++        # qwen27-pp: broadcast() only snapshots. broadcast_drafts sends one
++        # packed buffer after propose(). Reuse broadcast()'s mask: postprocess
++        # updates the GPU token count and can flip a recomputed one.
++        self._broadcast_this_step = False
++        self._pending_packed: torch.Tensor | None = None
+ 
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+@@ -121,13 +200,20 @@ class PPHandler:
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
+             idx_mapping=idx_mapping,
++            draft_tokens=slot.draft_tokens,
+         )
+ 
+-    def receive(self, input_batch: InputBatch) -> bool:
++    def receive(
++        self,
++        input_batch: InputBatch,
++        num_computed_tokens_gpu: torch.Tensor | None = None,
++    ) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+         requests in the batch."""
+         assert not self.is_last_rank
+-        need_sampled_mask = compute_need_sampled_mask(input_batch)
++        need_sampled_mask = compute_need_sampled_mask(
++            input_batch, num_computed_tokens_gpu
++        )
+         if need_sampled_mask is None:
+             # Leave this step's reserved slot as None.
+             return False
+@@ -139,22 +225,28 @@ class PPHandler:
+         num_reqs = input_batch.num_reqs
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+-            sampled_tokens = torch.empty(
+-                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
++            # qwen27-pp: one recv, matched by the single send in broadcast_drafts.
++            # [n, (k+1) + 2 + k] int64: tokens, num_sampled, num_rejected, drafts.
++            packed = torch.empty(
++                num_reqs,
++                self.max_sample_len + 2 + self.draft_width,
++                dtype=torch.int64,
++                device=self.device,
+             )
+-            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+             torch.distributed.broadcast(
+-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
++                packed, src=self.last_rank, group=self.broadcast_group
+             )
+-            torch.distributed.broadcast(
+-                combined, src=self.last_rank, group=self.broadcast_group
++            sampled_tokens, num_sampled, num_rejected, draft_tokens = _unpack_pp_step(
++                packed, self.max_sample_len, self.draft_width
+             )
+             event = self.broadcast_stream.record_event()
+-            num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+-            combined.record_stream(self.main_stream)
++            num_sampled.record_stream(self.main_stream)
++            num_rejected.record_stream(self.main_stream)
++            if draft_tokens is not None:
++                draft_tokens.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -164,6 +256,7 @@ class PPHandler:
+             input_batch.idx_mapping_np,
+             need_sampled_mask,
+             gen_at_receive_np,
++            draft_tokens,
+         )
+         return bool(need_sampled_mask.all())
+ 
+@@ -173,27 +266,126 @@ class PPHandler:
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
+         input_batch: InputBatch,
++        num_computed_tokens_gpu: torch.Tensor | None = None,
+     ) -> None:
+         assert self.is_last_rank
+-        if compute_need_sampled_mask(input_batch) is None:
++        need = compute_need_sampled_mask(input_batch, num_computed_tokens_gpu)
++        self._broadcast_this_step = need is not None
++        self._pending_packed = None
++        if need is None:
+             # No request needs sampled outputs for a subsequent decode step.
+             return
+ 
+         assert sampled_token_ids.dtype == torch.int64
++        # qwen27-pp: non-last ranks always receive [num_reqs, max_sample_len].
++        # A prefill with no draft tokens is sampled as [num_reqs, 1]; pad
++        # with -1 so the packed row width matches. post_update reads only
++        # the first num_sampled columns. The NCCL send itself is deferred to
++        # broadcast_drafts, when the draft ids exist too.
++        n = input_batch.num_reqs
++        ncols = sampled_token_ids.shape[-1]
++        assert sampled_token_ids.shape[0] == n
++        assert num_sampled.shape[0] == n
++        assert num_rejected.shape[0] == n
++        assert ncols <= self.max_sample_len
++        if ncols < self.max_sample_len:
++            padded = torch.full(
++                (n, self.max_sample_len),
++                -1,
++                dtype=torch.int64,
++                device=sampled_token_ids.device,
++            )
++            padded[:, :ncols] = sampled_token_ids
++            tokens = padded
++        else:
++            tokens = sampled_token_ids
++        self._pending_packed = _pack_pp_step(
++            tokens, num_sampled, num_rejected, self.draft_width
++        )
+ 
++    def broadcast_drafts(
++        self,
++        draft_tokens: torch.Tensor,
++        input_batch: InputBatch,
++        num_computed_tokens_gpu: torch.Tensor | None = None,
++    ) -> None:
++        """Send this step's sample, counts, and draft ids in one broadcast.
++
++        Call after the drafter has written `draft_tokens`. No-op when
++        `broadcast` decided this step has nothing to send. The mask is not
++        recomputed: `num_computed_tokens_gpu` is ignored because postprocess
++        may already have advanced it.
++        """
++        assert self.is_last_rank
++        # qwen27-pp: non-last ranks have no drafter, so their draft buffer stays
++        # zero unless these ids arrive before the next verify forward.
++        if not self._broadcast_this_step:
++            return
++        packed = self._pending_packed
++        assert packed is not None
++        # qwen27-pp: finish the row on this stream (drafts were just written
++        # here). The side stream only broadcasts the finished buffer.
++        if self.draft_width > 0:
++            assert draft_tokens.dtype == torch.int64
++            n = input_batch.num_reqs
++            assert draft_tokens.shape[0] == n
++            assert packed.shape[0] == n
++            cols = min(int(draft_tokens.shape[-1]), self.draft_width)
++            if cols > 0:
++                k1 = self.max_sample_len
++                packed[:, k1 + 2 : k1 + 2 + cols] = draft_tokens[:, :cols]
++        ready = torch.cuda.Event()
++        ready.record()
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+-
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            self.broadcast_stream.wait_event(ready)
+             torch.distributed.broadcast(
+-                sampled_token_ids.contiguous(),
++                packed,
+                 src=self.last_rank,
+                 group=self.broadcast_group,
+             )
+-            combined = torch.stack((num_sampled, num_rejected), dim=0)
+-            torch.distributed.broadcast(
+-                combined, src=self.last_rank, group=self.broadcast_group
+-            )
+-            for tensor in (sampled_token_ids, num_sampled, num_rejected):
+-                tensor.record_stream(self.broadcast_stream)
++        self._pending_packed = None
++
++
++def scatter_draft_tokens(
++    idx_mapping: torch.Tensor,
++    draft_tokens: torch.Tensor,
++    dst: torch.Tensor,
++) -> None:
++    """Write draft rows into req-state slots. idx_mapping < 0 skips the row."""
++    # qwen27-pp: non-last ranks install the broadcast draft ids into req state.
++    num_reqs, width = draft_tokens.shape
++    if num_reqs == 0 or width == 0:
++        return
++    _scatter_draft_tokens_kernel[(num_reqs,)](
++        idx_mapping,
++        draft_tokens,
++        dst,
++        draft_tokens.stride(0),
++        dst.stride(0),
++        width,
++        BLOCK=triton.next_power_of_2(width),
++        num_warps=1,
++    )
++
++
++@triton.jit
++def _scatter_draft_tokens_kernel(
++    idx_mapping_ptr,
++    src_ptr,
++    dst_ptr,
++    src_stride,
++    dst_stride,
++    width,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    req = tl.load(idx_mapping_ptr + row)
++    if req < 0:
++        return
++    cols = tl.arange(0, BLOCK)
++    mask = cols < width
++    vals = tl.load(src_ptr + row * src_stride + cols, mask=mask)
++    tl.store(dst_ptr + req * dst_stride + cols, vals, mask=mask)
+diff --git a/v1/worker/gpu/spec_decode/dflash/utils.py b/v1/worker/gpu/spec_decode/dflash/utils.py
+index 562966e..9d601b4 100644
+--- a/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -3,8 +3,8 @@
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, replace
+-from vllm.distributed.parallel_state import get_pp_group
+ from vllm.model_executor.model_loader import get_model
++from vllm.model_executor.models.utils import PPMissingLayer
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+     _should_share,
+     get_target_lm_head,
+@@ -54,11 +54,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     target_inner = getattr(target_language_model, "model", target_language_model)
+     draft_inner = dflash_model.model
+ 
+-    # Skip embedding sharing under PP — each rank owns its own embedding.
+-    if get_pp_group().world_size == 1:
+-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+-            target_inner, "embedding", None
+-        )
++    # qwen27-pp: share the embedding when this rank actually owns one.
++    # The drafter is loaded on the last PP rank; PPMissingLayer means there
++    # is nothing to share. PP size 1 is unchanged (the module is real).
++    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
++        target_inner, "embedding", None
++    )
++    if not isinstance(target_embed, PPMissingLayer):
+         draft_embed = getattr(draft_inner, "embed_tokens", None)
+         if target_embed is not None and _should_share(
+             dflash_model, "has_own_embed_tokens", draft_embed, target_embed

@@ -44,3 +44,7 @@ patch -p1 -N -d "$V" < 17-swa-fine-grained-prefix-hits.patch
 # 18: lazy GDN (14) turns itself off when the verify block exceeds 8 tokens (DFLASH_TOKENS > 7): its per-slot log
 #     and replay kernel are sized for 8, and a 16-token block accepted only the first draft.
 patch -p1 -N -d "$V" < 18-lazy-gdn-width-guard.patch
+# 19: DFlash2 under pipeline parallel (PP=2 over both cards): draft model pp=1, drafter aux hidden states carried
+#     across the stage boundary, embedding shared on the last rank, one packed sampled/draft broadcast per step,
+#     drafts scattered on earlier ranks. A no-op at PP=1. Deploy with deploy/hyperqwen-pp.service.
+patch -p1 -N -d "$V" < 19-pipeline-parallel-dflash.patch
